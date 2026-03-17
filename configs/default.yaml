@@ -23,7 +23,7 @@ experiment:
   num_workers: 4
 
 wandb:
-  enabled: false          # set to true to activate W&B logging
+  enabled: true          # set to true to activate W&B logging
   project: test
   mode: online            # online | offline | disabled
   tags: []

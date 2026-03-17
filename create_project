@@ -1,0 +1,2234 @@
+#!/usr/bin/env python3
+"""Create a standard folder structure for AI research projects."""
+
+import os
+import argparse
+import subprocess
+
+
+STRUCTURE = {
+    "data": {
+        "raw": {},
+        "processed": {},
+        "external": {},
+    },
+    "src": {
+        "data": {},
+        "models": {},
+        "features": {},
+        "visualization": {},
+        "tracking": {},
+        "utils": {},
+    },
+    "outputs": {
+        "experiments": {},
+        "figures": {},
+        "tables": {},
+        "predictions": {},
+    },
+    "interpretations": {
+        "notes": {},
+        "reports": {},
+    },
+    "notebooks": {},
+    "configs": {
+        "model": {},
+        "data": {},
+    },
+    "scripts": {},
+    "logs": {},
+    "tests": {},
+}
+
+GITKEEPS = True  # Add .gitkeep to empty dirs so git tracks them
+
+# Template Python files to create: {relative_path: content}
+TEMPLATES = {
+    # =========================================================================
+    # YAML configs (Hydra / OmegaConf)
+    # =========================================================================
+    "configs/default.yaml": """\
+# ── Default experiment configuration ──
+# Override any value from the CLI:
+#   python scripts/train.py experiment.seed=123 model=transformer
+
+project:
+  name: {project_name}
+
+paths:
+  data_raw:       data/raw
+  data_processed: data/processed
+  data_external:  data/external
+  outputs:        outputs
+  experiments:    outputs/experiments
+  figures:        outputs/figures
+  tables:         outputs/tables
+  predictions:    outputs/predictions
+  logs:           logs
+
+experiment:
+  name: default
+  seed: 42
+  test_size: 0.2
+  num_workers: 4
+
+wandb:
+  enabled: false          # set to true to activate W&B logging
+  project: {project_name}
+  mode: online            # online | offline | disabled
+  tags: []
+  notes: ""
+
+defaults:
+  - model: baseline
+  - data: default
+""",
+
+    "configs/model/baseline.yaml": """\
+# ── Baseline model configuration ──
+model:
+  name: mlp
+  params:
+    hidden_dims: [128, 64]
+    dropout: 0.1
+    lr: 0.001
+    weight_decay: 0.0001
+    batch_size: 64
+    epochs: 50
+    patience: 10
+    scheduler: plateau     # cosine | step | plateau
+""",
+
+    "configs/model/transformer.yaml": """\
+# ── Transformer / deep learning model configuration ──
+model:
+  name: transformer
+  params:
+    d_model: 256
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    lr: 0.001
+    weight_decay: 0.0001
+    batch_size: 32
+    epochs: 50
+    patience: 10          # early stopping patience
+    scheduler: cosine     # cosine | step | plateau
+""",
+
+    "configs/data/default.yaml": """\
+# ── Dataset configuration ──
+data:
+  name: default
+  file: dataset.csv
+  target_column: target
+  features: null            # null = use all columns except target
+  split_strategy: random    # random | stratified | temporal
+  val_size: 0.1
+  test_size: 0.2
+  preprocessing:
+    handle_missing: mean    # drop | mean | median | zero
+    scale: standard         # standard | minmax | robust | null
+    drop_duplicates: true
+""",
+
+    # =========================================================================
+    # src package inits
+    # =========================================================================
+    "src/__init__.py": '"""Source package."""\n',
+
+    "src/data/__init__.py": '"""Data loading and processing utilities."""\n',
+
+    "src/data/load_data.py": '''\
+"""Functions for loading raw data."""
+
+import os
+import pandas as pd
+
+
+def load_csv(filepath: str) -> pd.DataFrame:
+    """Load a CSV file and return a DataFrame."""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Data file not found: {filepath}")
+    return pd.read_csv(filepath)
+
+
+def load_all_csvs(directory: str) -> dict[str, pd.DataFrame]:
+    """Load all CSV files from a directory into a dict keyed by filename."""
+    dataframes = {}
+    for fname in sorted(os.listdir(directory)):
+        if fname.endswith(".csv"):
+            dataframes[fname] = pd.read_csv(os.path.join(directory, fname))
+    return dataframes
+
+
+if __name__ == "__main__":
+    print("load_data module ready")
+''',
+
+    "src/data/preprocess.py": '''\
+"""Functions for cleaning and transforming data."""
+
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+
+
+def clean_dataframe(df: pd.DataFrame, drop_duplicates: bool = True) -> pd.DataFrame:
+    """Basic cleaning: drop duplicates, reset index."""
+    if drop_duplicates:
+        df = df.drop_duplicates()
+    df = df.reset_index(drop=True)
+    return df
+
+
+def handle_missing(df: pd.DataFrame, strategy: str = "drop") -> pd.DataFrame:
+    """Handle missing values with the given strategy."""
+    if strategy == "drop":
+        return df.dropna()
+    elif strategy == "mean":
+        return df.fillna(df.mean(numeric_only=True))
+    elif strategy == "median":
+        return df.fillna(df.median(numeric_only=True))
+    elif strategy == "zero":
+        return df.fillna(0)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
+def scale_features(df: pd.DataFrame, method: str = "standard", columns: list[str] | None = None):
+    """Scale numeric columns. Returns (scaled_df, scaler)."""
+    scalers = {
+        "standard": StandardScaler,
+        "minmax": MinMaxScaler,
+        "robust": RobustScaler,
+    }
+    if method not in scalers:
+        raise ValueError(f"Unknown scaling method: {method}. Choose from {list(scalers)}")
+
+    if columns is None:
+        columns = df.select_dtypes(include="number").columns.tolist()
+
+    scaler = scalers[method]()
+    df = df.copy()
+    df[columns] = scaler.fit_transform(df[columns])
+    return df, scaler
+
+
+if __name__ == "__main__":
+    print("preprocess module ready")
+''',
+
+    "src/data/dataset.py": '''\
+"""Dataset classes for structured data loading."""
+
+import pandas as pd
+from torch.utils.data import Dataset
+import torch
+
+
+class TabularDataset(Dataset):
+    """PyTorch Dataset for tabular (DataFrame) data.
+
+    Args:
+        df: DataFrame containing features and target.
+        target_column: Name of the target column.
+        feature_columns: Feature column names (default: all except target).
+        task: "classification" or "regression" — controls target dtype.
+    """
+
+    def __init__(self, df: pd.DataFrame, target_column: str,
+                 feature_columns: list[str] | None = None,
+                 task: str = "classification"):
+        if feature_columns is None:
+            feature_columns = [c for c in df.columns if c != target_column]
+        self.X = torch.tensor(df[feature_columns].values, dtype=torch.float32)
+        if task == "classification":
+            self.y = torch.tensor(df[target_column].values, dtype=torch.long)
+        else:
+            self.y = torch.tensor(df[target_column].values, dtype=torch.float32)
+        self.feature_columns = feature_columns
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+if __name__ == "__main__":
+    print("dataset module ready")
+''',
+
+    # =========================================================================
+    # models
+    # =========================================================================
+    "src/models/__init__.py": '"""Model training and evaluation."""\\n',
+
+    "src/models/architectures.py": '''\
+"""PyTorch model architectures."""
+
+import torch
+import torch.nn as nn
+
+
+class MLP(nn.Module):
+    """Multi-layer perceptron for tabular data."""
+
+    def __init__(self, input_dim: int, output_dim: int, hidden_dims: list[int] = None,
+                 dropout: float = 0.1):
+        super().__init__()
+        hidden_dims = hidden_dims or [128, 64]
+        layers = []
+        prev = input_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
+            prev = h
+        layers.append(nn.Linear(prev, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TabularTransformer(nn.Module):
+    """Transformer encoder for tabular data."""
+
+    def __init__(self, input_dim: int, output_dim: int, d_model: int = 256,
+                 nhead: int = 8, num_layers: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Linear(d_model, output_dim)
+
+    def forward(self, x):
+        # x: (batch, features) -> (batch, 1, d_model) -> pool -> (batch, d_model)
+        x = self.embedding(x).unsqueeze(1)
+        x = self.encoder(x).squeeze(1)
+        return self.head(x)
+
+
+def build_model(name: str, input_dim: int, output_dim: int, params: dict) -> nn.Module:
+    """Factory function to create a model by name."""
+    if name == "mlp":
+        return MLP(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dims=params.get("hidden_dims", [128, 64]),
+            dropout=params.get("dropout", 0.1),
+        )
+    elif name == "transformer":
+        return TabularTransformer(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            d_model=params.get("d_model", 256),
+            nhead=params.get("nhead", 8),
+            num_layers=params.get("num_layers", 4),
+            dropout=params.get("dropout", 0.1),
+        )
+    else:
+        raise ValueError(f"Unknown model: {name}. Choose from: mlp, transformer")
+
+
+if __name__ == "__main__":
+    print("architectures module ready")
+''',
+
+    "src/models/train.py": '''\
+"""PyTorch model training utilities."""
+
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+
+def train_model(model, train_loader: DataLoader, val_loader: DataLoader | None,
+                device: str, epochs: int = 50, lr: float = 0.001,
+                weight_decay: float = 0.0001, patience: int = 10,
+                scheduler_type: str = "plateau", task: str = "classification",
+                logger=None, wandb_tracker=None):
+    """Train a PyTorch model with early stopping.
+
+    Returns (model, history) where history is a dict of metric lists.
+    """
+    model = model.to(device)
+
+    if task == "classification":
+        criterion = nn.CrossEntropyLoss()
+    else:
+        criterion = nn.MSELoss()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # Scheduler
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif scheduler_type == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    elif scheduler_type == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=patience // 2)
+    else:
+        scheduler = None
+
+    history = {"train_loss": [], "val_loss": []}
+    best_val_loss = float("inf")
+    best_state = None
+    wait = 0
+
+    for epoch in range(1, epochs + 1):
+        # ── Train ──
+        model.train()
+        total_loss, n = 0.0, 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(X_batch)
+            n += len(X_batch)
+        train_loss = total_loss / n
+        history["train_loss"].append(train_loss)
+
+        # ── Validate ──
+        val_loss = None
+        if val_loader is not None:
+            model.eval()
+            total_loss, n = 0.0, 0
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                    output = model(X_batch)
+                    loss = criterion(output, y_batch)
+                    total_loss += loss.item() * len(X_batch)
+                    n += len(X_batch)
+            val_loss = total_loss / n
+            history["val_loss"].append(val_loss)
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    print(f"  Early stopping at epoch {epoch}")
+                    break
+
+            # Scheduler step
+            if scheduler is not None:
+                if scheduler_type == "plateau":
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
+        else:
+            if scheduler is not None and scheduler_type != "plateau":
+                scheduler.step()
+
+        if logger:
+            logger.log_metric("train_loss", train_loss, step=epoch)
+            if val_loss is not None:
+                logger.log_metric("val_loss", val_loss, step=epoch)
+
+        if wandb_tracker:
+            epoch_metrics = {"train_loss": train_loss, "epoch": epoch}
+            if val_loss is not None:
+                epoch_metrics["val_loss"] = val_loss
+            wandb_tracker.log_metrics(epoch_metrics, step=epoch)
+
+        if epoch % 10 == 0 or epoch == 1:
+            msg = f"  Epoch {epoch:>4d} | train_loss: {train_loss:.4f}"
+            if val_loss is not None:
+                msg += f" | val_loss: {val_loss:.4f}"
+            print(msg)
+
+    # Restore best weights
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, history
+
+
+def save_model(model, filepath: str, metadata: dict | None = None):
+    """Save a PyTorch model to disk."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    state = {"model_state_dict": model.state_dict()}
+    if metadata:
+        state["metadata"] = metadata
+    torch.save(state, filepath)
+    print(f"Model saved to {filepath}")
+
+
+def load_model(model, filepath: str, device: str = "cpu"):
+    """Load weights into a PyTorch model."""
+    checkpoint = torch.load(filepath, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, checkpoint.get("metadata", {})
+
+
+if __name__ == "__main__":
+    print("train module ready")
+''',
+
+    "src/models/evaluate.py": '''\
+"""PyTorch model evaluation utilities."""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    mean_squared_error,
+    r2_score,
+)
+
+
+@torch.no_grad()
+def predict(model: nn.Module, loader: DataLoader, device: str,
+            task: str = "classification") -> tuple[np.ndarray, np.ndarray]:
+    """Run inference and return (y_true, y_pred) as numpy arrays."""
+    model.eval()
+    all_preds, all_targets = [], []
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(device)
+        output = model(X_batch)
+        if task == "classification":
+            preds = output.argmax(dim=1).cpu().numpy()
+        else:
+            preds = output.squeeze(-1).cpu().numpy()
+        all_preds.append(preds)
+        all_targets.append(y_batch.numpy())
+    return np.concatenate(all_targets), np.concatenate(all_preds)
+
+
+def classification_report(y_true, y_pred) -> dict:
+    """Return a dict of common classification metrics."""
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+    }
+
+
+def regression_report(y_true, y_pred) -> dict:
+    """Return a dict of common regression metrics."""
+    return {
+        "mse": float(mean_squared_error(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2_score(y_true, y_pred)),
+    }
+
+
+if __name__ == "__main__":
+    print("evaluate module ready")
+''',
+
+    # =========================================================================
+    # features
+    # =========================================================================
+    "src/features/__init__.py": '"""Feature engineering utilities."""\n',
+
+    "src/features/build_features.py": '''\
+"""Feature engineering and selection."""
+
+import pandas as pd
+
+
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived / engineered features to the DataFrame."""
+    # TODO: Add project-specific feature engineering
+    return df
+
+
+def select_features(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Select a subset of columns."""
+    missing = set(columns) - set(df.columns)
+    if missing:
+        raise ValueError(f"Columns not found in DataFrame: {missing}")
+    return df[columns]
+
+
+if __name__ == "__main__":
+    print("build_features module ready")
+''',
+
+    # =========================================================================
+    # visualization
+    # =========================================================================
+    "src/visualization/__init__.py": '"""Visualization utilities."""\n',
+
+    "src/visualization/plot.py": '''\
+"""Plotting functions for analysis and results."""
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+
+def setup_style():
+    """Set a consistent plot style."""
+    sns.set_theme(style="whitegrid")
+    plt.rcParams.update({"figure.figsize": (10, 6), "figure.dpi": 150})
+
+
+def save_figure(fig, filename: str, output_dir: str = "outputs/figures"):
+    """Save a matplotlib figure to the outputs directory."""
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, filename)
+    fig.savefig(filepath, bbox_inches="tight")
+    print(f"Figure saved to {filepath}")
+
+
+def plot_distribution(df, column: str, title: str = None):
+    """Plot the distribution of a single column."""
+    setup_style()
+    fig, ax = plt.subplots()
+    sns.histplot(df[column], kde=True, ax=ax)
+    ax.set_title(title or f"Distribution of {column}")
+    return fig
+
+
+def plot_correlation_matrix(df, title: str = "Correlation Matrix"):
+    """Plot a heatmap of the correlation matrix."""
+    setup_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    sns.heatmap(df.corr(numeric_only=True), annot=True, fmt=".2f", cmap="coolwarm", ax=ax)
+    ax.set_title(title)
+    return fig
+
+
+def plot_training_history(history: dict, output_dir: str = None):
+    """Plot training loss / metric curves from a history dict.
+
+    history should look like: {"train_loss": [...], "val_loss": [...], "val_f1": [...]}
+    """
+    setup_style()
+    fig, axes = plt.subplots(1, len(history), figsize=(6 * len(history), 5))
+    if len(history) == 1:
+        axes = [axes]
+    for ax, (key, values) in zip(axes, history.items()):
+        ax.plot(values)
+        ax.set_title(key)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(key)
+    fig.tight_layout()
+    if output_dir:
+        save_figure(fig, "training_history.png", output_dir)
+    return fig
+
+
+if __name__ == "__main__":
+    print("plot module ready")
+''',
+
+    # =========================================================================
+    # tracking — lightweight experiment logger
+    # =========================================================================
+    "src/tracking/__init__.py": '''\
+"""Experiment tracking utilities."""
+
+from src.tracking.logger import ExperimentLogger
+from src.tracking.wandb_tracker import WandbTracker
+
+__all__ = ["ExperimentLogger", "WandbTracker"]
+''',
+
+    "src/tracking/logger.py": '''\
+"""Lightweight experiment logger.
+
+Saves experiment configs, metrics, and artifacts into a timestamped run
+directory.  Works standalone or as a thin wrapper you can later swap for
+MLflow / Weights & Biases.
+"""
+
+import json
+import os
+import shutil
+from datetime import datetime
+
+
+class ExperimentLogger:
+    """Log configs, metrics, and artifacts for a single experiment run."""
+
+    def __init__(self, experiment_name: str, base_dir: str = "outputs/experiments"):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_name = f"{experiment_name}_{timestamp}"
+        self.run_dir = os.path.join(base_dir, self.run_name)
+        self.metrics_path = os.path.join(self.run_dir, "metrics.json")
+        self.config_path = os.path.join(self.run_dir, "config.yaml")
+        self.artifacts_dir = os.path.join(self.run_dir, "artifacts")
+
+        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(self.artifacts_dir, exist_ok=True)
+
+        self._metrics: dict[str, list] = {}
+        self._params: dict = {}
+        print(f"[ExperimentLogger] Run directory: {self.run_dir}")
+
+    # -- config --
+    def log_config(self, cfg: dict):
+        """Save the full experiment config (dict or OmegaConf)."""
+        self._params = cfg
+        with open(self.config_path, "w") as f:
+            # Use json for dicts; if you use OmegaConf pass OmegaConf.to_yaml(cfg)
+            json.dump(cfg, f, indent=2, default=str)
+
+    # -- metrics --
+    def log_metric(self, key: str, value: float, step: int | None = None):
+        """Append a metric value (optionally with a step number)."""
+        if key not in self._metrics:
+            self._metrics[key] = []
+        entry = {"value": value}
+        if step is not None:
+            entry["step"] = step
+        self._metrics[key].append(entry)
+        self._flush_metrics()
+
+    def log_metrics(self, metrics: dict[str, float], step: int | None = None):
+        """Log multiple metrics at once."""
+        for k, v in metrics.items():
+            self.log_metric(k, v, step)
+
+    def _flush_metrics(self):
+        with open(self.metrics_path, "w") as f:
+            json.dump(self._metrics, f, indent=2)
+
+    # -- artifacts --
+    def log_artifact(self, filepath: str):
+        """Copy a file into the run's artifacts directory."""
+        dest = os.path.join(self.artifacts_dir, os.path.basename(filepath))
+        shutil.copy2(filepath, dest)
+        print(f"[ExperimentLogger] Artifact saved: {dest}")
+
+    # -- summary --
+    def summary(self) -> dict:
+        """Return the latest value of every metric."""
+        return {k: v[-1]["value"] for k, v in self._metrics.items()}
+
+    def __repr__(self):
+        return f"ExperimentLogger(run={self.run_name!r})"
+
+
+if __name__ == "__main__":
+    print("tracking.logger module ready")
+''',
+
+    "src/tracking/wandb_tracker.py": '''\
+"""Weights & Biases experiment tracker.
+
+Thin wrapper around wandb that mirrors the ExperimentLogger interface,
+so both can be used side-by-side in the training loop.
+"""
+
+import os
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+
+class WandbTracker:
+    """Log configs, metrics, and artifacts to Weights & Biases."""
+
+    def __init__(
+        self,
+        project: str,
+        experiment_name: str,
+        config: dict | None = None,
+        tags: list[str] | None = None,
+        notes: str | None = None,
+        mode: str = "online",
+    ):
+        if wandb is None:
+            raise ImportError(
+                "wandb is not installed. Install it with: pip install wandb"
+            )
+
+        self.run = wandb.init(
+            project=project,
+            name=experiment_name,
+            config=config or {},
+            tags=tags,
+            notes=notes,
+            mode=mode,  # "online", "offline", or "disabled"
+        )
+
+    def log_config(self, cfg: dict):
+        """Update the run config."""
+        self.run.config.update(cfg, allow_val_change=True)
+
+    def log_metric(self, key: str, value: float, step: int | None = None):
+        """Log a single metric."""
+        payload = {key: value}
+        if step is not None:
+            payload["step"] = step
+        self.run.log(payload, step=step)
+
+    def log_metrics(self, metrics: dict[str, float], step: int | None = None):
+        """Log multiple metrics at once."""
+        self.run.log(metrics, step=step)
+
+    def log_artifact(self, filepath: str, artifact_type: str = "model"):
+        """Upload a file as a wandb artifact."""
+        name = os.path.splitext(os.path.basename(filepath))[0]
+        artifact = wandb.Artifact(name, type=artifact_type)
+        artifact.add_file(filepath)
+        self.run.log_artifact(artifact)
+
+    def summary(self) -> dict:
+        """Return wandb run summary."""
+        return dict(self.run.summary)
+
+    def finish(self):
+        """End the wandb run."""
+        self.run.finish()
+
+    def __repr__(self):
+        return f"WandbTracker(run={self.run.name!r})"
+''',
+
+    # =========================================================================
+    # utils — reproducibility, IO, general helpers
+    # =========================================================================
+    "src/utils/__init__.py": '"""General utilities."""\n',
+
+    "src/utils/reproducibility.py": '''\
+"""Seed and determinism helpers for reproducible experiments."""
+
+import os
+import random
+
+import numpy as np
+
+
+def seed_everything(seed: int = 42):
+    """Set seeds for Python, NumPy, and (optionally) PyTorch / TensorFlow."""
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
+
+    try:
+        import tensorflow as tf
+        tf.random.set_seed(seed)
+    except ImportError:
+        pass
+
+    print(f"[reproducibility] All seeds set to {seed}")
+
+
+def get_device() -> str:
+    """Return the best available device string."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+if __name__ == "__main__":
+    seed_everything()
+    print(f"Device: {get_device()}")
+''',
+
+    "src/utils/gpu.py": '''\
+"""GPU selection and CUDA_VISIBLE_DEVICES management.
+
+Called before each training/evaluation/prediction run to let the user
+confirm or change which GPUs to use.
+"""
+
+import os
+import subprocess
+
+
+GPU_CONFIG_PATH = "/Tmp/hassicir/ai-research/gpu.conf"
+
+
+def detect_gpus() -> list[str]:
+    """Return a list of GPU info lines via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return []
+
+
+def load_gpu_config() -> str | None:
+    """Load the saved CUDA_VISIBLE_DEVICES value from the global config."""
+    if os.path.exists(GPU_CONFIG_PATH):
+        with open(GPU_CONFIG_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("CUDA_VISIBLE_DEVICES="):
+                    return line.split("=", 1)[1]
+    return None
+
+
+def save_gpu_config(value: str):
+    """Save CUDA_VISIBLE_DEVICES to the global config file."""
+    os.makedirs(os.path.dirname(GPU_CONFIG_PATH), exist_ok=True)
+    with open(GPU_CONFIG_PATH, "w") as f:
+        f.write(f"CUDA_VISIBLE_DEVICES={value}\\n")
+
+
+def setup_gpu(no_gpu: bool = False, gpus: str | None = None) -> str | None:
+    """Set up CUDA_VISIBLE_DEVICES before a run.
+
+    Args:
+        no_gpu:  If True, skip the prompt and use all available GPUs.
+        gpus:    If provided, use these GPU ids directly (no prompt).
+
+    Returns:
+        The CUDA_VISIBLE_DEVICES value that was set, or None if unrestricted.
+    """
+    if gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+        save_gpu_config(gpus)
+        print(f"[GPU] CUDA_VISIBLE_DEVICES = {gpus}")
+        return gpus
+
+    if no_gpu:
+        # Remove any restriction -- use all GPUs
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        print("[GPU] Using all available GPUs (no restriction)")
+        return None
+
+    # Interactive prompt
+    gpu_lines = detect_gpus()
+    current = load_gpu_config()
+
+    if gpu_lines:
+        print("\\n  Available GPUs:")
+        for line in gpu_lines:
+            parts = [p.strip() for p in line.split(",")]
+            idx, name = parts[0], parts[1]
+            mem_total = parts[2] if len(parts) > 2 else "?"
+            mem_free = parts[3] if len(parts) > 3 else "?"
+            print(f"    [{idx}] {name}  ({mem_free}/{mem_total} MiB free)")
+    else:
+        print("\\n  No NVIDIA GPUs detected.")
+
+    prompt = "  Select GPUs (comma-separated, e.g. 0,1)"
+    if current is not None:
+        prompt += f" [current: {current}]"
+    prompt += ", or Enter for all: "
+
+    value = input(prompt).strip()
+
+    if not value and current is not None:
+        # Keep current selection
+        os.environ["CUDA_VISIBLE_DEVICES"] = current
+        print(f"[GPU] CUDA_VISIBLE_DEVICES = {current}")
+        return current
+    elif value:
+        os.environ["CUDA_VISIBLE_DEVICES"] = value
+        save_gpu_config(value)
+        print(f"[GPU] CUDA_VISIBLE_DEVICES = {value}")
+        return value
+    else:
+        # Empty input, no previous config -- use all
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        print("[GPU] Using all available GPUs (no restriction)")
+        return None
+
+
+if __name__ == "__main__":
+    setup_gpu()
+''',
+
+    "src/utils/io.py": '''\
+"""I/O helpers: checkpoint saving/loading, config utilities."""
+
+import json
+import os
+
+import torch
+import yaml
+
+
+def save_checkpoint(state: dict, filepath: str):
+    """Save a training checkpoint to disk using torch.save."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    torch.save(state, filepath)
+    print(f"Checkpoint saved: {filepath}")
+
+
+def load_checkpoint(filepath: str, device: str = "cpu") -> dict:
+    """Load a training checkpoint from disk."""
+    return torch.load(filepath, map_location=device, weights_only=False)
+
+
+def load_yaml(filepath: str) -> dict:
+    """Load a YAML config file into a dict."""
+    with open(filepath, "r") as f:
+        return yaml.safe_load(f)
+
+
+def save_json(data: dict, filepath: str):
+    """Save a dict as a pretty-printed JSON file."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def load_json(filepath: str) -> dict:
+    """Load a JSON file into a dict."""
+    with open(filepath, "r") as f:
+        return json.load(f)
+
+
+if __name__ == "__main__":
+    print("utils.io module ready")
+''',
+
+    # =========================================================================
+    # scripts — separate entry points
+    # =========================================================================
+    "scripts/train.py": '''\
+#!/usr/bin/env python3
+"""Train a PyTorch model using a YAML config.
+
+Usage:
+    python scripts/train.py                              # prompt for GPUs, use default config
+    python scripts/train.py --no-gpu                     # use all available GPUs, no prompt
+    python scripts/train.py --gpus 0,1                   # specify GPUs directly
+    python scripts/train.py --config configs/default.yaml --override experiment.seed=123
+"""
+
+import argparse
+import os
+import sys
+
+# Ensure project root is on sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from torch.utils.data import DataLoader
+
+from src.utils.gpu import setup_gpu
+from src.utils.io import load_yaml
+from src.utils.reproducibility import seed_everything, get_device
+from src.data.load_data import load_csv
+from src.data.preprocess import clean_dataframe, handle_missing, scale_features
+from src.data.dataset import TabularDataset
+from src.features.build_features import add_derived_features
+from src.models.architectures import build_model
+from src.models.train import train_model, save_model
+from src.models.evaluate import predict, classification_report, regression_report
+from src.tracking.logger import ExperimentLogger
+from src.tracking.wandb_tracker import WandbTracker
+
+
+def _deep_update(base: dict, overrides: dict) -> dict:
+    """Recursively merge overrides into base."""
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def _parse_override(s: str):
+    """Parse 'a.b.c=val' into a nested dict."""
+    key, _, val = s.partition("=")
+    # Try to cast to int/float/bool
+    for caster in (int, float):
+        try:
+            val = caster(val)
+            break
+        except (ValueError, TypeError):
+            continue
+    else:
+        if val.lower() in ("true", "false"):
+            val = val.lower() == "true"
+        elif val.lower() == "null":
+            val = None
+
+    parts = key.split(".")
+    d = {}
+    current = d
+    for p in parts[:-1]:
+        current[p] = {}
+        current = current[p]
+    current[parts[-1]] = val
+    return d
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train a PyTorch model.")
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config")
+    parser.add_argument("--override", nargs="*", default=[], help="Config overrides: key.subkey=value")
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument("--no-gpu", action="store_true",
+                           help="Use all available GPUs without prompting")
+    gpu_group.add_argument("--gpus", metavar="IDS",
+                           help="Set CUDA_VISIBLE_DEVICES directly (e.g. '0,1')")
+    args = parser.parse_args()
+
+    # ── GPU setup (before any CUDA calls) ──
+    setup_gpu(no_gpu=args.no_gpu, gpus=args.gpus)
+
+    # ── Load config ──
+    cfg = load_yaml(args.config)
+
+    # Merge sub-configs (model, data) referenced by defaults
+    defaults = cfg.pop("defaults", [])
+    for default in defaults:
+        if isinstance(default, dict):
+            for group, name in default.items():
+                sub_path = os.path.join(os.path.dirname(args.config), group, f"{name}.yaml")
+                if os.path.exists(sub_path):
+                    sub_cfg = load_yaml(sub_path)
+                    _deep_update(cfg, sub_cfg)
+
+    # Apply CLI overrides
+    for ov in args.override:
+        _deep_update(cfg, _parse_override(ov))
+
+    exp_cfg = cfg.get("experiment", {})
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    paths_cfg = cfg.get("paths", {})
+
+    # ── Setup ──
+    seed_everything(exp_cfg.get("seed", 42))
+    device = get_device()
+    print(f"Device: {device}")
+
+    logger = ExperimentLogger(
+        experiment_name=exp_cfg.get("name", "default"),
+        base_dir=paths_cfg.get("experiments", "outputs/experiments"),
+    )
+    logger.log_config(cfg)
+
+    # ── W&B tracking (optional) ──
+    wandb_cfg = cfg.get("wandb", {})
+    wb = None
+    if wandb_cfg.get("enabled", False):
+        wb = WandbTracker(
+            project=wandb_cfg.get("project", cfg.get("project", {}).get("name", "default")),
+            experiment_name=exp_cfg.get("name", "default"),
+            config=cfg,
+            tags=wandb_cfg.get("tags", []),
+            notes=wandb_cfg.get("notes", ""),
+            mode=wandb_cfg.get("mode", "online"),
+        )
+        print("[wandb] Run initialized")
+
+    # ── Pipeline ──
+    # 1. Load data
+    data_file = os.path.join(paths_cfg.get("data_raw", "data/raw"), data_cfg.get("file", "dataset.csv"))
+    print(f"Loading data from {data_file} ...")
+    df = load_csv(data_file)
+    print(f"  Loaded {len(df)} rows, {len(df.columns)} columns")
+
+    # 2. Preprocess
+    preproc = data_cfg.get("preprocessing", {})
+    df = clean_dataframe(df, drop_duplicates=preproc.get("drop_duplicates", True))
+    df = handle_missing(df, strategy=preproc.get("handle_missing", "drop"))
+    target = data_cfg.get("target_column", "target")
+    if preproc.get("scale") and preproc["scale"] != "null":
+        feature_cols = [c for c in df.columns if c != target]
+        df, _scaler = scale_features(df, method=preproc["scale"], columns=feature_cols)
+
+    # 3. Feature engineering
+    df = add_derived_features(df)
+
+    # 4. Determine task type
+    y = df[target]
+    if y.dtype.kind == "f" and y.nunique() > 20:
+        task = "regression"
+        output_dim = 1
+    else:
+        task = "classification"
+        output_dim = int(y.nunique())
+
+    # 5. Split into train / val / test
+    from sklearn.model_selection import train_test_split
+    test_size = data_cfg.get("test_size", exp_cfg.get("test_size", 0.2))
+    val_size = data_cfg.get("val_size", 0.1)
+    stratify = y if data_cfg.get("split_strategy") == "stratified" else None
+    seed = exp_cfg.get("seed", 42)
+
+    df_train, df_test = train_test_split(
+        df, test_size=test_size, random_state=seed, stratify=stratify,
+    )
+    stratify_val = df_train[target] if stratify is not None else None
+    df_train, df_val = train_test_split(
+        df_train, test_size=val_size / (1 - test_size), random_state=seed,
+        stratify=stratify_val,
+    )
+    print(f"  Train: {len(df_train)}, Val: {len(df_val)}, Test: {len(df_test)}")
+
+    # 6. Create DataLoaders
+    model_params = model_cfg.get("params", {})
+    batch_size = model_params.get("batch_size", 64)
+    num_workers = exp_cfg.get("num_workers", 4)
+
+    train_ds = TabularDataset(df_train, target, task=task)
+    val_ds = TabularDataset(df_val, target, task=task)
+    test_ds = TabularDataset(df_test, target, task=task)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=num_workers)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=num_workers)
+
+    # 7. Build model
+    model_name = model_cfg.get("name", "mlp")
+    input_dim = train_ds.X.shape[1]
+    model = build_model(model_name, input_dim, output_dim, model_params)
+    print(f"  Model: {model_name} ({task}, in={input_dim}, out={output_dim})")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # 8. Train
+    model, history = train_model(
+        model, train_loader, val_loader, device=device,
+        epochs=model_params.get("epochs", 50),
+        lr=model_params.get("lr", 0.001),
+        weight_decay=model_params.get("weight_decay", 0.0001),
+        patience=model_params.get("patience", 10),
+        scheduler_type=model_params.get("scheduler", "plateau"),
+        task=task, logger=logger, wandb_tracker=wb,
+    )
+
+    # 9. Evaluate on test set
+    y_true, y_pred = predict(model, test_loader, device, task=task)
+    if task == "classification":
+        metrics = classification_report(y_true, y_pred)
+    else:
+        metrics = regression_report(y_true, y_pred)
+    logger.log_metrics(metrics)
+    if wb is not None:
+        wb.log_metrics(metrics)
+    print(f"  Test metrics: {metrics}")
+
+    # 10. Save model
+    model_path = os.path.join(logger.run_dir, "artifacts", "model.pt")
+    metadata = {"model_name": model_name, "input_dim": input_dim,
+                "output_dim": output_dim, "task": task, "params": model_params}
+    save_model(model, model_path, metadata=metadata)
+
+    # Save training history plot
+    from src.visualization.plot import plot_training_history
+    plot_training_history(history, output_dir=os.path.join(logger.run_dir, "artifacts"))
+
+    # Upload model artifact to W&B
+    if wb is not None:
+        wb.log_artifact(model_path, artifact_type="model")
+        wb.finish()
+
+    print(f"\\nExperiment complete: {logger.run_dir}")
+    print(f"  Summary: {logger.summary()}")
+
+
+if __name__ == "__main__":
+    main()
+''',
+
+    "scripts/evaluate.py": '''\
+#!/usr/bin/env python3
+"""Evaluate a saved PyTorch model on a dataset.
+
+Usage:
+    python scripts/evaluate.py --run outputs/experiments/default_20240101_120000 --data data/raw/test.csv
+    python scripts/evaluate.py --no-gpu --run <run> --data <csv>
+"""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from torch.utils.data import DataLoader
+
+from src.utils.gpu import setup_gpu
+from src.utils.io import load_json, save_json
+from src.utils.reproducibility import get_device
+from src.data.load_data import load_csv
+from src.data.preprocess import clean_dataframe, handle_missing
+from src.data.dataset import TabularDataset
+from src.models.architectures import build_model
+from src.models.train import load_model
+from src.models.evaluate import predict, classification_report, regression_report
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a trained PyTorch model.")
+    parser.add_argument("--run", required=True, help="Path to an experiment run directory")
+    parser.add_argument("--data", required=True, help="Path to evaluation data CSV")
+    parser.add_argument("--output", help="Path to save evaluation results JSON")
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument("--no-gpu", action="store_true",
+                           help="Use all available GPUs without prompting")
+    gpu_group.add_argument("--gpus", metavar="IDS",
+                           help="Set CUDA_VISIBLE_DEVICES directly (e.g. '0,1')")
+    args = parser.parse_args()
+
+    # ── GPU setup ──
+    setup_gpu(no_gpu=args.no_gpu, gpus=args.gpus)
+    device = get_device()
+
+    # Load run config to reconstruct model
+    cfg_path = os.path.join(args.run, "config.yaml")
+    cfg = load_json(cfg_path)
+    model_cfg = cfg.get("model", {})
+    data_cfg = cfg.get("data", {})
+    target = data_cfg.get("target_column", "target")
+
+    # Load and reconstruct model
+    model_path = os.path.join(args.run, "artifacts", "model.pt")
+    print(f"Loading model from {model_path}")
+    import torch
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    meta = checkpoint.get("metadata", {})
+    model = build_model(meta["model_name"], meta["input_dim"], meta["output_dim"],
+                        meta.get("params", {}))
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    task = meta.get("task", "classification")
+
+    # Load data
+    print(f"Loading data from {args.data}")
+    df = load_csv(args.data)
+    df = clean_dataframe(df)
+    df = handle_missing(df, strategy="drop")
+
+    dataset = TabularDataset(df, target, task=task)
+    loader = DataLoader(dataset, batch_size=64, num_workers=0)
+
+    # Evaluate
+    y_true, y_pred = predict(model, loader, device, task=task)
+    if task == "classification":
+        metrics = classification_report(y_true, y_pred)
+    else:
+        metrics = regression_report(y_true, y_pred)
+
+    print(f"Metrics: {metrics}")
+
+    out_path = args.output or os.path.join(args.run, "eval_results.json")
+    save_json(metrics, out_path)
+    print(f"Results saved to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
+''',
+
+    "scripts/predict.py": '''\
+#!/usr/bin/env python3
+"""Run inference with a trained PyTorch model and save predictions.
+
+Usage:
+    python scripts/predict.py --run outputs/experiments/default_20240101_120000 --data data/raw/new_data.csv
+    python scripts/predict.py --no-gpu --run <run> --data <csv>
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.utils.gpu import setup_gpu
+from src.utils.io import load_json
+from src.utils.reproducibility import get_device
+from src.data.load_data import load_csv
+from src.data.preprocess import clean_dataframe, handle_missing
+from src.models.architectures import build_model
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run inference with a trained PyTorch model.")
+    parser.add_argument("--run", required=True, help="Path to an experiment run directory")
+    parser.add_argument("--data", required=True, help="Path to input CSV")
+    parser.add_argument("--output", default="outputs/predictions/predictions.csv", help="Output CSV path")
+    parser.add_argument("--drop-columns", nargs="*", default=[], help="Columns to drop before prediction")
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument("--no-gpu", action="store_true",
+                           help="Use all available GPUs without prompting")
+    gpu_group.add_argument("--gpus", metavar="IDS",
+                           help="Set CUDA_VISIBLE_DEVICES directly (e.g. '0,1')")
+    args = parser.parse_args()
+
+    # ── GPU setup ──
+    setup_gpu(no_gpu=args.no_gpu, gpus=args.gpus)
+    device = get_device()
+
+    # Load run config and reconstruct model
+    model_path = os.path.join(args.run, "artifacts", "model.pt")
+    print(f"Loading model from {model_path}")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+    meta = checkpoint.get("metadata", {})
+    model = build_model(meta["model_name"], meta["input_dim"], meta["output_dim"],
+                        meta.get("params", {}))
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+    task = meta.get("task", "classification")
+
+    # Load data
+    print(f"Loading data from {args.data}")
+    df = load_csv(args.data)
+    df = clean_dataframe(df)
+    df = handle_missing(df, strategy="drop")
+
+    if args.drop_columns:
+        df = df.drop(columns=args.drop_columns, errors="ignore")
+
+    # Run inference
+    X = torch.tensor(df.select_dtypes(include="number").values, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        output = model(X)
+        if task == "classification":
+            predictions = output.argmax(dim=1).cpu().numpy()
+        else:
+            predictions = output.squeeze(-1).cpu().numpy()
+
+    result = df.copy()
+    result["prediction"] = predictions
+
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    result.to_csv(args.output, index=False)
+    print(f"Predictions saved to {args.output} ({len(result)} rows)")
+
+
+if __name__ == "__main__":
+    main()
+''',
+
+    "scripts/preprocess.py": '''\
+#!/usr/bin/env python3
+"""Run the data preprocessing pipeline only.
+
+Usage:
+    python scripts/preprocess.py --config configs/default.yaml
+    python scripts/preprocess.py --input data/raw/dataset.csv --output data/processed/clean.csv
+"""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.utils.io import load_yaml
+from src.data.load_data import load_csv
+from src.data.preprocess import clean_dataframe, handle_missing, scale_features
+from src.features.build_features import add_derived_features
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Preprocess raw data.")
+    parser.add_argument("--config", help="Path to YAML config")
+    parser.add_argument("--input", help="Path to input CSV (overrides config)")
+    parser.add_argument("--output", help="Path to save processed CSV (overrides config)")
+    args = parser.parse_args()
+
+    if args.config:
+        cfg = load_yaml(args.config)
+        # Merge sub-configs
+        defaults = cfg.pop("defaults", [])
+        for default in defaults:
+            if isinstance(default, dict):
+                for group, name in default.items():
+                    sub_path = os.path.join(os.path.dirname(args.config), group, f"{name}.yaml")
+                    if os.path.exists(sub_path):
+                        sub_cfg = load_yaml(sub_path)
+                        cfg.update(sub_cfg)
+        data_cfg = cfg.get("data", {})
+        paths_cfg = cfg.get("paths", {})
+    else:
+        data_cfg = {}
+        paths_cfg = {}
+
+    input_path = args.input or os.path.join(
+        paths_cfg.get("data_raw", "data/raw"),
+        data_cfg.get("file", "dataset.csv"),
+    )
+    output_path = args.output or os.path.join(
+        paths_cfg.get("data_processed", "data/processed"),
+        "processed_" + os.path.basename(input_path),
+    )
+
+    print(f"Loading: {input_path}")
+    df = load_csv(input_path)
+    print(f"  Raw shape: {df.shape}")
+
+    preproc = data_cfg.get("preprocessing", {})
+    df = clean_dataframe(df, drop_duplicates=preproc.get("drop_duplicates", True))
+    df = handle_missing(df, strategy=preproc.get("handle_missing", "drop"))
+
+    if preproc.get("scale") and preproc["scale"] != "null":
+        target = data_cfg.get("target_column", "target")
+        feature_cols = [c for c in df.columns if c != target]
+        df, _ = scale_features(df, method=preproc["scale"], columns=feature_cols)
+
+    df = add_derived_features(df)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df.to_csv(output_path, index=False)
+    print(f"  Processed shape: {df.shape}")
+    print(f"  Saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
+''',
+
+    # =========================================================================
+    # tests
+    # =========================================================================
+    "tests/__init__.py": "",
+
+    "tests/test_preprocess.py": '''\
+"""Tests for data preprocessing."""
+
+import pandas as pd
+from src.data.preprocess import clean_dataframe, handle_missing
+
+
+def test_clean_dataframe_drops_duplicates():
+    df = pd.DataFrame({"a": [1, 1, 2], "b": [3, 3, 4]})
+    result = clean_dataframe(df)
+    assert len(result) == 2
+
+
+def test_handle_missing_drop():
+    df = pd.DataFrame({"a": [1, None, 3], "b": [4, 5, 6]})
+    result = handle_missing(df, strategy="drop")
+    assert result.isna().sum().sum() == 0
+
+
+def test_handle_missing_zero():
+    df = pd.DataFrame({"a": [1, None, 3]})
+    result = handle_missing(df, strategy="zero")
+    assert result["a"].iloc[1] == 0
+''',
+
+    "tests/test_tracking.py": '''\
+"""Tests for experiment tracking."""
+
+import os
+import tempfile
+
+from src.tracking.logger import ExperimentLogger
+
+
+def test_experiment_logger_creates_run_dir():
+    with tempfile.TemporaryDirectory() as tmp:
+        logger = ExperimentLogger("test_exp", base_dir=tmp)
+        assert os.path.isdir(logger.run_dir)
+        assert os.path.isdir(logger.artifacts_dir)
+
+
+def test_experiment_logger_logs_metrics():
+    with tempfile.TemporaryDirectory() as tmp:
+        logger = ExperimentLogger("test_exp", base_dir=tmp)
+        logger.log_metric("loss", 0.5, step=1)
+        logger.log_metric("loss", 0.3, step=2)
+        summary = logger.summary()
+        assert summary["loss"] == 0.3
+        assert os.path.exists(logger.metrics_path)
+''',
+
+    # =========================================================================
+    # Makefile
+    # =========================================================================
+    "Makefile": """\
+.PHONY: help train evaluate predict preprocess test clean
+
+help:  ## Show this help
+\t@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \\
+\t\tawk 'BEGIN {FS = ":.*?## "}; {printf "\\033[36m%-20s\\033[0m %s\\n", $$1, $$2}'
+
+# ── Data ──
+preprocess:  ## Run the preprocessing pipeline
+\tpython scripts/preprocess.py --config configs/default.yaml
+
+# ── Training ──
+train:  ## Train a model with default config
+\tpython scripts/train.py --config configs/default.yaml
+
+train-custom:  ## Train with overrides (e.g. make train-custom ARGS="--override model=transformer experiment.seed=99")
+\tpython scripts/train.py --config configs/default.yaml $(ARGS)
+
+# ── Evaluation ──
+evaluate:  ## Evaluate latest run (set RUN=path/to/run)
+\tpython scripts/evaluate.py --run $(RUN) --data data/raw/test.csv
+
+predict:  ## Run inference (set RUN=path/to/run DATA=path/to/csv)
+\tpython scripts/predict.py --run $(RUN) --data $(DATA)
+
+# ── Testing ──
+test:  ## Run unit tests
+\tpython -m pytest tests/ -v
+
+# ── Cleanup ──
+clean:  ## Remove caches and compiled files
+\tfind . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+\tfind . -type f -name "*.pyc" -delete 2>/dev/null || true
+""",
+
+    # =========================================================================
+    # main.py (kept as a quick-start alias)
+    # =========================================================================
+    "main.py": '''\
+"""Quick-start entry point — delegates to scripts/train.py.
+
+For full control use the individual scripts:
+    python scripts/train.py --config configs/default.yaml
+    python scripts/evaluate.py --run outputs/experiments/<run>
+    python scripts/predict.py --run outputs/experiments/<run> --data data.csv
+    python scripts/preprocess.py --config configs/default.yaml
+"""
+
+import subprocess
+import sys
+
+
+def main():
+    """Run the training script with default config."""
+    cmd = [sys.executable, "scripts/train.py"] + sys.argv[1:]
+    subprocess.run(cmd, check=True)
+
+
+if __name__ == "__main__":
+    main()
+''',
+}
+
+
+def create_structure(base_path, structure):
+    for name, children in structure.items():
+        path = os.path.join(base_path, name)
+        os.makedirs(path, exist_ok=True)
+        if GITKEEPS and not children:
+            open(os.path.join(path, ".gitkeep"), "a").close()
+        if children:
+            create_structure(path, children)
+
+
+def write_templates(base_path, project_name):
+    """Write template files, skipping any that already exist."""
+    for rel_path, content in TEMPLATES.items():
+        filepath = os.path.join(base_path, rel_path)
+        if not os.path.exists(filepath):
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "w") as f:
+                f.write(content.replace("{project_name}", project_name))
+
+
+def write_root_files(base_path):
+    project_name = os.path.basename(os.path.abspath(base_path))
+
+    # ── README ──
+    readme = os.path.join(base_path, "README.md")
+    if not os.path.exists(readme):
+        with open(readme, "w") as f:
+            f.write(f"""\
+# {project_name}
+
+---
+
+## How This Project Was Created
+
+This project was generated by the `create_project` script.
+
+### The `create_project` command
+
+```bash
+create_project <name> [options]
+```
+
+| Argument / Flag | Description |
+|---|---|
+| `name` | Project name or nested path (e.g. `my_project` or `NLP/sentiment`) |
+| `--gpus IDS` | Set `CUDA_VISIBLE_DEVICES` directly (e.g. `--gpus 0,1`) |
+| `--no-gpu` | Skip the GPU prompt, use all available GPUs (no restriction) |
+
+If neither `--gpus` nor `--no-gpu` is passed, the script will:
+1. Run `nvidia-smi` to detect available GPUs and list them.
+2. Show any previously saved selection (stored in `~/.config/ai-research/gpu.conf`).
+3. Prompt you to pick which GPUs to use.
+4. Save your choice globally **and** write a `.env` file into the project.
+
+The script also runs `git init` and creates an initial commit automatically.
+
+### Examples
+
+```bash
+# Create a project — will prompt for GPU selection
+create_project PG_PV
+
+# Create a project with specific GPUs (no prompt)
+create_project PG_PV --gpus 0,2
+
+# Create a project, skip GPU setup entirely
+create_project PG_PV --no-gpu
+
+# Nested project path
+create_project NLP/sentiment_analysis --gpus 0
+```
+
+### GPU configuration
+
+The GPU selection is stored in two places:
+
+| Location | Scope |
+|---|---|
+| `/Tmp/hassicir/ai-research/gpu.conf` | Global — shared across all projects, used as default for future projects |
+| `<project>/.env` | Per-project — `CUDA_VISIBLE_DEVICES=...` written here for scripts to source |
+
+To use the `.env` in your scripts, either:
+- Source it: `source .env && python scripts/train.py`
+- Or load it in Python with `python-dotenv` (already referenced in the training scripts)
+- Or export it in your shell profile: `export $(cat .env | xargs)`
+
+To change GPUs later, either edit `.env` directly or re-run `create_project`
+on the same project name (existing files are never overwritten).
+
+### GPU prompt before each run
+
+Every script (`train.py`, `evaluate.py`, `predict.py`) will **prompt you to
+select GPUs** before the run starts. This ensures you always know which GPUs
+you are using. The prompt shows available GPUs with free memory and your last
+selection as the default.
+
+```bash
+# Will prompt for GPU selection, then train
+python scripts/train.py
+
+# Skip prompt, use all available GPUs
+python scripts/train.py --no-gpu
+
+# Use specific GPUs, no prompt
+python scripts/train.py --gpus 0,1
+```
+
+The `--no-gpu` and `--gpus` flags work the same way on all scripts:
+
+| Flag | Behavior |
+|---|---|
+| *(none)* | Prompt to select GPUs (shows available + free memory) |
+| `--no-gpu` | Use all available GPUs, no restriction, no prompt |
+| `--gpus 0,1` | Set `CUDA_VISIBLE_DEVICES=0,1` directly, no prompt |
+
+---
+
+## Project Structure
+
+```
+{project_name}/
+├── configs/                 # YAML experiment configurations
+│   ├── default.yaml         #   base config (paths, seeds, defaults)
+│   ├── model/               #   model-specific configs
+│   │   ├── baseline.yaml    #     PyTorch MLP
+│   │   └── transformer.yaml #     deep learning model
+│   └── data/                #   dataset-specific configs
+│       └── default.yaml     #     default dataset settings
+├── scripts/                 # Entry points — run these
+│   ├── train.py             #   train a model
+│   ├── evaluate.py          #   evaluate a saved model
+│   ├── predict.py           #   run inference on new data
+│   └── preprocess.py        #   run data pipeline only
+├── src/                     # Reusable source code
+│   ├── data/                #   data loading & preprocessing
+│   │   ├── load_data.py
+│   │   ├── preprocess.py
+│   │   └── dataset.py       #   PyTorch Dataset class
+│   ├── models/              #   training & evaluation
+│   │   ├── architectures.py #   PyTorch model definitions (MLP, Transformer)
+│   │   ├── train.py
+│   │   └── evaluate.py
+│   ├── features/            #   feature engineering
+│   │   └── build_features.py
+│   ├── visualization/       #   plotting utilities
+│   │   └── plot.py
+│   ├── tracking/            #   experiment logging
+│   │   ├── logger.py
+│   │   └── wandb_tracker.py #   W&B integration
+│   └── utils/               #   helpers
+│       ├── reproducibility.py  # seed_everything, get_device
+│       ├── io.py               # save/load checkpoints, YAML, JSON
+│       └── gpu.py              # GPU selection and management
+├── data/
+│   ├── raw/                 # Original, immutable data
+│   ├── processed/           # Cleaned / transformed data
+│   └── external/            # Third-party data
+├── outputs/
+│   ├── experiments/         # Each run gets its own timestamped dir
+│   ├── figures/             # Saved plots
+│   ├── tables/              # Exported tables / CSVs
+│   └── predictions/         # Inference outputs
+├── logs/                    # Training logs, stdout captures
+├── interpretations/
+│   ├── notes/               # Research notes
+│   └── reports/             # Written reports / papers
+├── notebooks/               # Jupyter notebooks for exploration
+├── tests/                   # Unit and integration tests
+├── .env                     # CUDA_VISIBLE_DEVICES (auto-generated)
+├── Makefile                 # Common commands (make train, make test, ...)
+├── requirements.txt         # Pinned Python dependencies
+└── README.md
+```
+
+---
+
+## Quick Start
+
+### Step 1 — Set up the environment
+
+```bash
+cd {project_name}
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Step 2 — Add your data
+
+Place your raw data file (e.g. `dataset.csv`) inside `data/raw/`.
+
+### Step 3 — Configure the experiment
+
+Edit `configs/data/default.yaml` to match your dataset:
+
+```yaml
+data:
+  name: my_dataset
+  file: dataset.csv            # filename inside data/raw/
+  target_column: target        # the column you want to predict
+  split_strategy: stratified   # random | stratified | temporal
+  preprocessing:
+    handle_missing: mean
+    scale: standard
+```
+
+Edit `configs/model/baseline.yaml` to tune hyperparameters:
+
+```yaml
+model:
+  name: mlp
+  params:
+    hidden_dims: [256, 128]
+    dropout: 0.2
+    lr: 0.001
+    epochs: 100
+```
+
+### Step 4 — Preprocess data (optional)
+
+```bash
+python scripts/preprocess.py --config configs/default.yaml
+# Or: make preprocess
+```
+
+Saves cleaned data to `data/processed/`.
+
+### Step 5 — Train a model
+
+```bash
+# Default config
+python scripts/train.py
+
+# With overrides
+python scripts/train.py --override experiment.seed=123 experiment.name=seed_test
+
+# With a different model config
+python scripts/train.py --override model=transformer
+
+# Via Makefile
+make train
+```
+
+Each run creates a timestamped directory:
+```
+outputs/experiments/default_20260317_143022/
+├── config.yaml      # exact config snapshot
+├── metrics.json     # all logged metrics
+└── artifacts/
+    ├── model.pt     # the trained PyTorch model
+    └── training_history.png
+```
+
+### Step 6 — Evaluate a model
+
+```bash
+python scripts/evaluate.py \\
+    --run outputs/experiments/default_20260317_143022 \\
+    --data data/raw/test.csv
+
+# Or with a standalone model file
+python scripts/evaluate.py --model path/to/model.joblib --data test.csv --target label
+```
+
+### Step 7 — Run predictions
+
+```bash
+python scripts/predict.py \\
+    --run outputs/experiments/default_20260317_143022 \\
+    --data data/raw/new_data.csv \\
+    --output outputs/predictions/preds.csv
+```
+
+### Step 8 — Run tests
+
+```bash
+python -m pytest tests/ -v
+# Or: make test
+```
+
+---
+
+## Experiment Tracking
+
+Every training run is automatically logged by `src/tracking/logger.py`:
+
+- **Config snapshot** — the exact YAML config is saved so you can reproduce any run
+- **Metrics** — logged per step or per epoch; stored as JSON
+- **Artifacts** — the trained model (and anything else you log) is saved in the run dir
+
+### Comparing runs
+
+```bash
+for d in outputs/experiments/*/; do
+    echo "=== $(basename $d) ==="
+    cat "$d/metrics.json" | python -m json.tool
+done
+```
+
+### Weights & Biases integration
+
+W&B tracking is built in but disabled by default. To activate it:
+
+1. Set your API key in `.env`: `WANDB_API_KEY=your_key`
+2. Enable it in `configs/default.yaml`:
+   ```yaml
+   wandb:
+     enabled: true
+   ```
+   Or via CLI override: `--override wandb.enabled=true`
+
+When enabled, W&B will log per-epoch train/val loss, final test metrics, and
+upload the model artifact. Both the local `ExperimentLogger` and W&B run
+side-by-side so you always have a local copy.
+
+---
+
+## Configuration System
+
+Configs are YAML files in `configs/` following a hierarchical pattern:
+
+```
+configs/
+├── default.yaml         # base — references model + data sub-configs
+├── model/
+│   ├── baseline.yaml
+│   └── transformer.yaml
+└── data/
+    └── default.yaml
+```
+
+`default.yaml` pulls in sub-configs via the `defaults:` block:
+
+```yaml
+defaults:
+  - model: baseline
+  - data: default
+```
+
+Override any value from the CLI:
+
+```bash
+python scripts/train.py --override experiment.seed=99 model.params.n_estimators=500
+```
+
+---
+
+## Adding Custom Models
+
+1. Define your `nn.Module` in `src/models/architectures.py`
+2. Register it in the `build_model()` factory function
+3. Create a config in `configs/model/my_model.yaml`
+4. Train: `python scripts/train.py --override model=my_model`
+
+---
+
+## Tips
+
+- **Never modify `data/raw/`** — treat it as immutable.
+- **`make help`** shows all available Makefile commands.
+- **Pin deps** after installing: `pip freeze > requirements.txt`
+- **Notebooks are for exploration** — move reusable code into `src/`.
+- **Check `outputs/experiments/`** to review past runs and configs.
+- **GPU selection** is in `.env` — edit it or re-run `create_project` to change.
+""")
+
+    # ── requirements.txt ──
+    req = os.path.join(base_path, "requirements.txt")
+    if not os.path.exists(req):
+        with open(req, "w") as f:
+            f.write("\n".join([
+                "# Core",
+                "numpy",
+                "pandas",
+                "scikit-learn",
+                "",
+                "# Deep learning",
+                "torch",
+                "torchvision",
+                "",
+                "# Config",
+                "pyyaml",
+                "",
+                "# Visualization",
+                "matplotlib",
+                "seaborn",
+                "",
+                "# Testing",
+                "pytest",
+                "",
+                "# Experiment tracking (uncomment as needed)",
+                "# mlflow",
+                "wandb",
+                "",
+            ]))
+
+    # ── .gitignore ──
+    gitignore = os.path.join(base_path, ".gitignore")
+    if not os.path.exists(gitignore):
+        with open(gitignore, "w") as f:
+            f.write("\n".join([
+                "# Data (keep structure, ignore large files)",
+                "data/raw/*",
+                "data/external/*",
+                "!data/**/.gitkeep",
+                "",
+                "# Outputs",
+                "outputs/models/*",
+                "outputs/experiments/*",
+                "outputs/predictions/*",
+                "!outputs/**/.gitkeep",
+                "",
+                "# Logs",
+                "logs/*",
+                "!logs/.gitkeep",
+                "",
+                "# Environment",
+                ".env",
+                "",
+                "# Python",
+                "__pycache__/",
+                "*.pyc",
+                ".venv/",
+                "*.egg-info/",
+                "",
+                "# Jupyter",
+                ".ipynb_checkpoints/",
+                "",
+                "# IDE",
+                ".vscode/",
+                ".idea/",
+                "",
+            ]))
+
+
+PROJECTS_ROOT = os.path.expanduser("/Tmp/hassicir/Projects")
+
+# Path to the global GPU config file (shared across all projects)
+GPU_CONFIG_PATH = "/Tmp/hassicir/ai-research/gpu.conf"
+
+
+def detect_gpus() -> list[str]:
+    """Return a list of GPU info lines via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return []
+
+
+def load_gpu_config() -> str | None:
+    """Load the saved CUDA_VISIBLE_DEVICES value, or None if not set."""
+    if os.path.exists(GPU_CONFIG_PATH):
+        with open(GPU_CONFIG_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("CUDA_VISIBLE_DEVICES="):
+                    return line.split("=", 1)[1]
+    return None
+
+
+def save_gpu_config(value: str):
+    """Save CUDA_VISIBLE_DEVICES to the global config file."""
+    os.makedirs(os.path.dirname(GPU_CONFIG_PATH), exist_ok=True)
+    with open(GPU_CONFIG_PATH, "w") as f:
+        f.write(f"CUDA_VISIBLE_DEVICES={value}\n")
+    print(f"  GPU config saved to {GPU_CONFIG_PATH}")
+
+
+def prompt_gpu_selection():
+    """Interactively prompt the user to select GPUs.
+
+    Returns the CUDA_VISIBLE_DEVICES string (e.g. "0,1") or None to skip.
+    """
+    gpus = detect_gpus()
+
+    current = load_gpu_config()
+    if current is not None:
+        print(f"\n  Current CUDA_VISIBLE_DEVICES = {current}")
+
+    if not gpus:
+        print("\n  No NVIDIA GPUs detected (nvidia-smi not found or no GPUs).")
+        value = input("  Enter CUDA_VISIBLE_DEVICES manually (or press Enter to skip): ").strip()
+        if value:
+            save_gpu_config(value)
+            return value
+        return current
+
+    print("\n  Available GPUs:")
+    for line in gpus:
+        parts = [p.strip() for p in line.split(",")]
+        idx, name = parts[0], parts[1]
+        mem = parts[2] if len(parts) > 2 else "?"
+        print(f"    [{idx}] {name}  ({mem} MiB)")
+
+    prompt = "  Enter GPU ids to use (comma-separated, e.g. 0,1)"
+    if current is not None:
+        prompt += f" [current: {current}]"
+    prompt += ": "
+
+    value = input(prompt).strip()
+    if not value and current is not None:
+        return current  # keep existing
+    if value:
+        save_gpu_config(value)
+        return value
+    return current
+
+
+def write_env_file(base_path: str, cuda_devices: str | None):
+    """Write a .env file with CUDA_VISIBLE_DEVICES into the project."""
+    env_path = os.path.join(base_path, ".env")
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            lines = [l for l in f.readlines()
+                     if not l.startswith("CUDA_VISIBLE_DEVICES=")]
+
+    if cuda_devices is not None:
+        lines.insert(0, f"CUDA_VISIBLE_DEVICES={cuda_devices}\n")
+
+    # Add WANDB_API_KEY placeholder if not already present
+    if not any("WANDB_API_KEY" in l for l in lines):
+        lines.append("WANDB_API_KEY=\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create an AI research project folder structure.",
+        epilog="Examples:\n"
+               "  create_project my_project\n"
+               "  create_project NLP/sentiment --no-gpu\n"
+               "  create_project my_project --gpus 0,1\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("name",
+                        help="Project name or path (e.g. 'my_project' or 'NLP/sentiment_analysis')")
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument("--no-gpu", action="store_true",
+                           help="Skip GPU prompt, use all available GPUs (no restriction)")
+    gpu_group.add_argument("--gpus", metavar="IDS",
+                           help="Set CUDA_VISIBLE_DEVICES directly (e.g. '0,1')")
+    args = parser.parse_args()
+
+    project_name = os.path.basename(args.name)
+    base = os.path.join(PROJECTS_ROOT, args.name)
+    os.makedirs(base, exist_ok=True)
+
+    # ── GPU selection ──
+    cuda_devices = None
+    if args.gpus:
+        save_gpu_config(args.gpus)
+        cuda_devices = args.gpus
+        print(f"  CUDA_VISIBLE_DEVICES set to {cuda_devices}")
+    elif args.no_gpu:
+        print("  GPU prompt skipped — all available GPUs will be used")
+    else:
+        cuda_devices = prompt_gpu_selection()
+
+    # ── Create project ──
+    create_structure(base, STRUCTURE)
+    write_templates(base, project_name)
+    write_root_files(base)
+
+    if cuda_devices is not None:
+        write_env_file(base, cuda_devices)
+
+    # ── Git init ──
+    git_dir = os.path.join(base, ".git")
+    if not os.path.exists(git_dir):
+        subprocess.run(["git", "init", base], capture_output=True)
+        subprocess.run(["git", "-C", base, "add", "."], capture_output=True)
+        subprocess.run(
+            ["git", "-C", base, "commit", "-m", "Initial project structure"],
+            capture_output=True,
+        )
+        print(f"  Git repository initialized with initial commit")
+
+    # ── Print tree ──
+    print(f"\nProject created at: {base}\n")
+    for root, dirs, files in os.walk(base):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        level = root.replace(base, "").count(os.sep)
+        indent = "  " * level
+        print(f"{indent}{os.path.basename(root)}/")
+
+
+if __name__ == "__main__":
+    main()
