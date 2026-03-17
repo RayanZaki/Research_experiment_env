@@ -1,0 +1,13 @@
+# ── Dataset configuration ──
+data:
+  name: default
+  file: dataset.csv
+  target_column: target
+  features: null            # null = use all columns except target
+  split_strategy: random    # random | stratified | temporal
+  val_size: 0.1
+  test_size: 0.2
+  preprocessing:
+    handle_missing: mean    # drop | mean | median | zero
+    scale: standard         # standard | minmax | robust | null
+    drop_duplicates: true

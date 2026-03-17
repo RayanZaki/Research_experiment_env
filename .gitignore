@@ -1,0 +1,30 @@
+# Data (keep structure, ignore large files)
+data/raw/*
+data/external/*
+!data/**/.gitkeep
+
+# Outputs
+outputs/models/*
+outputs/experiments/*
+outputs/predictions/*
+!outputs/**/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,34 @@
+# ── Default experiment configuration ──
+# Override any value from the CLI:
+#   python scripts/train.py experiment.seed=123 model=transformer
+
+project:
+  name: test
+
+paths:
+  data_raw:       data/raw
+  data_processed: data/processed
+  data_external:  data/external
+  outputs:        outputs
+  experiments:    outputs/experiments
+  figures:        outputs/figures
+  tables:         outputs/tables
+  predictions:    outputs/predictions
+  logs:           logs
+
+experiment:
+  name: default
+  seed: 42
+  test_size: 0.2
+  num_workers: 4
+
+wandb:
+  enabled: false          # set to true to activate W&B logging
+  project: test
+  mode: online            # online | offline | disabled
+  tags: []
+  notes: ""
+
+defaults:
+  - model: baseline
+  - data: default

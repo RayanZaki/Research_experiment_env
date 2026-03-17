@@ -1,0 +1,12 @@
+# ── Baseline model configuration ──
+model:
+  name: mlp
+  params:
+    hidden_dims: [128, 64]
+    dropout: 0.1
+    lr: 0.001
+    weight_decay: 0.0001
+    batch_size: 64
+    epochs: 50
+    patience: 10
+    scheduler: plateau     # cosine | step | plateau

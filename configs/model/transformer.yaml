@@ -1,0 +1,14 @@
+# ── Transformer / deep learning model configuration ──
+model:
+  name: transformer
+  params:
+    d_model: 256
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    lr: 0.001
+    weight_decay: 0.0001
+    batch_size: 32
+    epochs: 50
+    patience: 10          # early stopping patience
+    scheduler: cosine     # cosine | step | plateau

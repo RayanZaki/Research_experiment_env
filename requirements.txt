@@ -1,0 +1,22 @@
+# Core
+numpy
+pandas
+scikit-learn
+
+# Deep learning
+torch
+torchvision
+
+# Config
+pyyaml
+
+# Visualization
+matplotlib
+seaborn
+
+# Testing
+pytest
+
+# Experiment tracking (uncomment as needed)
+# mlflow
+wandb
