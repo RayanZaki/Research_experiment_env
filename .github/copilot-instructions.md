@@ -42,6 +42,10 @@ This file is the persistent architecture contract for this repository. Always fo
 - `logs` stores runtime logs.
 - `tests` validates behavior.
 
+### 6) Project scaffolding
+- `create_project` scaffolds by cloning this repository template into the target path.
+- It then removes inherited `.git`, applies project-specific config values, writes `.env`, and initializes a fresh git repo.
+
 ## Update policy (mandatory)
 When anything in repository architecture, defaults, paths, scripts, module layout, or workflow changes:
 1. Update this file immediately.
