@@ -20,10 +20,21 @@ from pathlib import Path
 
 PROJECTS_ROOT = Path("/Tmp/hassicir/Projects")
 GPU_CONFIG_PATH = Path("/Tmp/hassicir/ai-research/gpu.conf")
+DEFAULT_TEMPLATE_REPO_URL = "git@github.com:RayanZaki/Research_experiment_env.git"
 
 
 def run(cmd: list[str], cwd: str | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def run_capture(cmd: list[str], cwd: str | None = None) -> str:
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
 
 
 def detect_gpus() -> list[str]:
@@ -155,6 +166,22 @@ def clone_template(repo: str, target_dir: Path) -> None:
         shutil.rmtree(inherited_git)
 
 
+def detect_default_template_repo() -> str:
+    env_value = os.environ.get("CREATE_PROJECT_TEMPLATE_REPO")
+    if env_value:
+        return env_value
+
+    script_dir = Path(__file__).resolve().parent
+    try:
+        toplevel = run_capture(["git", "rev-parse", "--show-toplevel"], cwd=str(script_dir))
+        if toplevel:
+            return toplevel
+    except Exception:
+        pass
+
+    return DEFAULT_TEMPLATE_REPO_URL
+
+
 def init_git_repo(project_dir: Path) -> None:
     run(["git", "init"], cwd=str(project_dir))
     run(["git", "add", "."], cwd=str(project_dir))
@@ -165,6 +192,8 @@ def init_git_repo(project_dir: Path) -> None:
 
 
 def main() -> int:
+    default_repo = detect_default_template_repo()
+
     parser = argparse.ArgumentParser(
         description="Create a project by cloning a template repo.",
         epilog=(
@@ -178,8 +207,11 @@ def main() -> int:
     parser.add_argument("name", help="Project name or nested path")
     parser.add_argument(
         "--repo",
-        default=os.environ.get("CREATE_PROJECT_TEMPLATE_REPO") or str(Path(__file__).resolve().parent),
-        help="Template repository URL/path (default: current repository)",
+        default=default_repo,
+        help=(
+            "Template repository URL/path "
+            "(default: CREATE_PROJECT_TEMPLATE_REPO, else enclosing git repo, else canonical template URL)"
+        ),
     )
 
     gpu_group = parser.add_mutually_exclusive_group()

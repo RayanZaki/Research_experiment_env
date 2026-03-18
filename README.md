@@ -17,7 +17,7 @@ create_project <name> [options]
 | Argument / Flag | Description |
 |---|---|
 | `name` | Project name or nested path (e.g. `my_project` or `NLP/sentiment`) |
-| `--repo URL_OR_PATH` | Template repository to clone (default: current repository) |
+| `--repo URL_OR_PATH` | Template repository to clone (default: env var, else enclosing git repo, else canonical template repo) |
 | `--gpus IDS` | Set `CUDA_VISIBLE_DEVICES` directly (e.g. `--gpus 0,1`) |
 | `--no-gpu` | Skip the GPU prompt, use all available GPUs (no restriction) |
 
