@@ -7,6 +7,7 @@ This file is the persistent architecture contract for this repository. Always fo
 
 ### 1) Entry points
 - `scripts/train.py`: end-to-end training pipeline (config load/merge, data load, preprocess, feature build, split, train, evaluate, save artifacts).
+- `scripts/transform.py`: external data acquisition + dataset transformation into `data/transformed`.
 - `scripts/preprocess.py`: preprocessing-only pipeline, writes processed CSV.
 - `scripts/evaluate.py`: evaluate a saved run/model on labeled data.
 - `scripts/predict.py`: run inference on unlabeled/new data.
@@ -20,15 +21,15 @@ This file is the persistent architecture contract for this repository. Always fo
   1. base config
   2. files in `defaults`
   3. CLI overrides
-- Path keys in `paths` define canonical locations (`data_raw`, `data_processed`, `data_external`, `outputs/*`, `logs`).
+- Path keys in `paths` define canonical locations (`data_external`, `data_transformed`, `data_processed`, `outputs/*`, `logs`).
 
 ### 3) Data lifecycle
-- `data/raw`: primary immutable input data.
-- `data/external`: third-party or auxiliary enrichment data.
-- `data/processed`: outputs of cleaning/feature preparation.
+- `data/external`: downloads and external assets (GitHub repos, archive files, datasets, folders, or any auxiliary artifacts).
+- `data/transformed`: transformed/standardized training-ready datasets and copied assets built from `external` via adapters.
+- `data/processed`: optional downstream outputs of additional cleaning/feature preparation.
 
 ### 4) Core library layout
-- `src/data`: loading, cleaning, dataset objects.
+- `src/data`: loading, acquisition, transformation adapters, cleaning, dataset objects.
 - `src/features`: feature engineering.
 - `src/models`: architectures, training, evaluation helpers.
 - `src/tracking`: run logging and optional Weights & Biases integration.

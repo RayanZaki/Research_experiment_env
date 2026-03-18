@@ -6,15 +6,20 @@ project:
   name: test
 
 paths:
-  data_raw:       data/raw
-  data_processed: data/processed
   data_external:  data/external
+  data_transformed: data/transformed
+  data_processed: data/processed
   outputs:        outputs
   experiments:    outputs/experiments
   figures:        outputs/figures
   tables:         outputs/tables
   predictions:    outputs/predictions
   logs:           logs
+
+external_sources:
+  github_repos: []
+  files: []
+  zip_files: []
 
 experiment:
   name: default

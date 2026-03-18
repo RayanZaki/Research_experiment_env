@@ -100,12 +100,14 @@ test/
 │       └── default.yaml     #     default dataset settings
 ├── scripts/                 # Entry points — run these
 │   ├── train.py             #   train a model
+│   ├── transform.py         #   download + transform to data/transformed
 │   ├── evaluate.py          #   evaluate a saved model
 │   ├── predict.py           #   run inference on new data
 │   └── preprocess.py        #   run data pipeline only
 ├── src/                     # Reusable source code
-│   ├── data/                #   data loading & preprocessing
+│   ├── data/                #   data loading, acquisition, transformation, preprocessing
 │   │   ├── load_data.py
+│   │   ├── transform.py
 │   │   ├── preprocess.py
 │   │   └── dataset.py       #   PyTorch Dataset class
 │   ├── models/              #   training & evaluation
@@ -124,9 +126,9 @@ test/
 │       ├── io.py               # save/load checkpoints, YAML, JSON
 │       └── gpu.py              # GPU selection and management
 ├── data/
-│   ├── raw/                 # Original, immutable data
-│   ├── processed/           # Cleaned / transformed data
-│   └── external/            # Third-party data
+│   ├── external/            # Downloads: repos, zip files, third-party assets
+│   ├── transformed/         # Standardized training-ready datasets + copied assets
+│   └── processed/           # Optional extra cleaned outputs
 ├── outputs/
 │   ├── experiments/         # Each run gets its own timestamped dir
 │   ├── figures/             # Saved plots
@@ -159,7 +161,8 @@ pip install -r requirements.txt
 
 ### Step 2 — Add your data
 
-Place your raw data file (e.g. `dataset.csv`) inside `data/raw/`.
+Put source assets in:
+- `data/external/` for downloaded repos/archives/auxiliary datasets or arbitrary folder/file assets
 
 ### Step 3 — Configure the experiment
 
@@ -168,7 +171,8 @@ Edit `configs/data/default.yaml` to match your dataset:
 ```yaml
 data:
   name: my_dataset
-  file: dataset.csv            # filename inside data/raw/
+  file: transformed_dataset.csv # filename inside data/transformed/
+  source: transformed
   target_column: target        # the column you want to predict
   split_strategy: stratified   # random | stratified | temporal
   preprocessing:
@@ -188,7 +192,47 @@ model:
     epochs: 100
 ```
 
-### Step 4 — Preprocess data (optional)
+Optional: define external downloads in `configs/default.yaml`:
+
+```yaml
+external_sources:
+  github_repos:
+    - url: https://github.com/owner/repo.git
+      dest: repo_name
+  files:
+    - url: https://host/data/lookup.csv
+      dest: lookup.csv
+  zip_files:
+    - url: https://host/data/archive.zip
+      dest: archive.zip
+      extract_to: datasets/archive
+```
+
+Adapter-based transform inputs (in `configs/data/default.yaml`):
+
+```yaml
+data:
+  transform:
+    inputs:
+      - path: tabular/train.csv
+        source: external
+        adapter: csv
+      - path: images/
+        source: external
+        adapter: copy_dir
+      - path: metadata.json
+        source: external
+        adapter: copy_file
+```
+
+### Step 4 — Download + transform to `data/transformed`
+
+```bash
+python scripts/transform.py --config configs/default.yaml
+# Or: make transform
+```
+
+### Step 5 — Preprocess transformed data (optional)
 
 ```bash
 python scripts/preprocess.py --config configs/default.yaml
@@ -197,7 +241,7 @@ python scripts/preprocess.py --config configs/default.yaml
 
 Saves cleaned data to `data/processed/`.
 
-### Step 5 — Train a model
+### Step 6 — Train a model
 
 ```bash
 # Default config
@@ -223,27 +267,27 @@ outputs/experiments/default_20260317_143022/
     └── training_history.png
 ```
 
-### Step 6 — Evaluate a model
+### Step 7 — Evaluate a model
 
 ```bash
 python scripts/evaluate.py \
     --run outputs/experiments/default_20260317_143022 \
-    --data data/raw/test.csv
+  --data data/transformed/test.csv
 
 # Or with a standalone model file
 python scripts/evaluate.py --model path/to/model.joblib --data test.csv --target label
 ```
 
-### Step 7 — Run predictions
+### Step 8 — Run predictions
 
 ```bash
 python scripts/predict.py \
     --run outputs/experiments/default_20260317_143022 \
-    --data data/raw/new_data.csv \
+    --data data/transformed/new_data.csv \
     --output outputs/predictions/preds.csv
 ```
 
-### Step 8 — Run tests
+### Step 9 — Run tests
 
 ```bash
 python -m pytest tests/ -v
@@ -328,7 +372,7 @@ python scripts/train.py --override experiment.seed=99 model.params.n_estimators=
 
 ## Tips
 
-- **Never modify `data/raw/`** — treat it as immutable.
+- Use adapters in `data.transform.inputs` for non-tabular external assets.
 - **`make help`** shows all available Makefile commands.
 - **Pin deps** after installing: `pip freeze > requirements.txt`
 - **Notebooks are for exploration** — move reusable code into `src/`.

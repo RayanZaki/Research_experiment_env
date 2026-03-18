@@ -8,9 +8,9 @@ import subprocess
 
 STRUCTURE = {
     "data": {
-        "raw": {},
-        "processed": {},
         "external": {},
+        "transformed": {},
+        "processed": {},
     },
     "src": {
         "data": {},
@@ -54,6 +54,7 @@ This file is the persistent architecture contract for this repository. Always fo
 
 ### 1) Entry points
 - `scripts/train.py`: end-to-end training pipeline (config load/merge, data load, preprocess, feature build, split, train, evaluate, save artifacts).
+- `scripts/transform.py`: external data acquisition + dataset transformation into `data/transformed`.
 - `scripts/preprocess.py`: preprocessing-only pipeline, writes processed CSV.
 - `scripts/evaluate.py`: evaluate a saved run/model on labeled data.
 - `scripts/predict.py`: run inference on unlabeled/new data.
@@ -67,15 +68,15 @@ This file is the persistent architecture contract for this repository. Always fo
     1. base config
     2. files in `defaults`
     3. CLI overrides
-- Path keys in `paths` define canonical locations (`data_raw`, `data_processed`, `data_external`, `outputs/*`, `logs`).
+- Path keys in `paths` define canonical locations (`data_external`, `data_transformed`, `data_processed`, `outputs/*`, `logs`).
 
 ### 3) Data lifecycle
-- `data/raw`: primary immutable input data.
-- `data/external`: third-party or auxiliary enrichment data.
-- `data/processed`: outputs of cleaning/feature preparation.
+- `data/external`: downloads and external assets (GitHub repos, archive files, datasets, folders, or any auxiliary artifacts).
+- `data/transformed`: transformed/standardized training-ready datasets and copied assets built from `external` via adapters.
+- `data/processed`: optional downstream outputs of additional cleaning/feature preparation.
 
 ### 4) Core library layout
-- `src/data`: loading, cleaning, dataset objects.
+- `src/data`: loading, acquisition, transformation adapters, cleaning, dataset objects.
 - `src/features`: feature engineering.
 - `src/models`: architectures, training, evaluation helpers.
 - `src/tracking`: run logging and optional Weights & Biases integration.
@@ -106,41 +107,46 @@ When anything in repository architecture, defaults, paths, scripts, module layou
     # =========================================================================
     # YAML configs (Hydra / OmegaConf)
     # =========================================================================
-    "configs/default.yaml": """\
+        "configs/default.yaml": """\
 # ── Default experiment configuration ──
 # Override any value from the CLI:
 #   python scripts/train.py experiment.seed=123 model=transformer
 
 project:
-  name: {project_name}
+    name: {project_name}
 
 paths:
-  data_raw:       data/raw
-  data_processed: data/processed
-  data_external:  data/external
-  outputs:        outputs
-  experiments:    outputs/experiments
-  figures:        outputs/figures
-  tables:         outputs/tables
-  predictions:    outputs/predictions
-  logs:           logs
+    data_external: data/external
+    data_transformed: data/transformed
+    data_processed: data/processed
+    outputs: outputs
+    experiments: outputs/experiments
+    figures: outputs/figures
+    tables: outputs/tables
+    predictions: outputs/predictions
+    logs: logs
+
+external_sources:
+    github_repos: []
+    files: []
+    zip_files: []
 
 experiment:
-  name: default
-  seed: 42
-  test_size: 0.2
-  num_workers: 4
+    name: default
+    seed: 42
+    test_size: 0.2
+    num_workers: 4
 
 wandb:
-  enabled: false          # set to true to activate W&B logging
-  project: {project_name}
-  mode: online            # online | offline | disabled
-  tags: []
-  notes: ""
+    enabled: false          # set to true to activate W&B logging
+    project: {project_name}
+    mode: online            # online | offline | disabled
+    tags: []
+    notes: ""
 
 defaults:
-  - model: baseline
-  - data: default
+    - model: baseline
+    - data: default
 """,
 
     "configs/model/baseline.yaml": """\
@@ -178,8 +184,9 @@ model:
     "configs/data/default.yaml": """\
 # ── Dataset configuration ──
 data:
-  name: default
-  file: dataset.csv
+    name: default
+    file: transformed_dataset.csv
+    source: transformed       # transformed | external | processed
   target_column: target
   features: null            # null = use all columns except target
   split_strategy: random    # random | stratified | temporal
@@ -189,6 +196,10 @@ data:
     handle_missing: mean    # drop | mean | median | zero
     scale: standard         # standard | minmax | robust | null
     drop_duplicates: true
+  transform:
+        inputs: []                          # [{path: "my.csv", source: external, adapter: csv}, {path: "assets", source: external, adapter: copy_dir}]
+    output_file: transformed_dataset.csv
+    include_source_column: true
 """,
 
     # =========================================================================
@@ -199,7 +210,7 @@ data:
     "src/data/__init__.py": '"""Data loading and processing utilities."""\n',
 
     "src/data/load_data.py": '''\
-"""Functions for loading raw data."""
+"""Functions for loading tabular data files."""
 
 import os
 import pandas as pd
@@ -223,6 +234,258 @@ def load_all_csvs(directory: str) -> dict[str, pd.DataFrame]:
 
 if __name__ == "__main__":
     print("load_data module ready")
+''',
+
+    "src/data/transform.py": '''\
+"""Data acquisition and transformation utilities.
+
+This module supports:
+1) Downloading external sources into data/external (Git repos, files, zip archives)
+2) Transforming heterogeneous inputs into data/transformed via adapters
+   (csv adapter + generic file/dir copy adapters)
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import pandas as pd
+
+from src.data.load_data import load_csv
+from src.data.preprocess import clean_dataframe, handle_missing, scale_features
+from src.features.build_features import add_derived_features
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def clone_github_repo(repo_url: str, destination: str, branch: str | None = None, depth: int = 1) -> str:
+    """Clone a GitHub repository into destination.
+
+    If destination already exists and is non-empty, the clone is skipped.
+    """
+    dest = Path(destination)
+    if dest.exists() and any(dest.iterdir()):
+        print(f"[transform] Skip clone (already exists): {destination}")
+        return str(dest)
+
+    _ensure_dir(str(dest.parent))
+
+    cmd = ["git", "clone", "--depth", str(depth)]
+    if branch:
+        cmd += ["--branch", branch]
+    cmd += [repo_url, str(dest)]
+
+    print(f"[transform] Cloning {repo_url} -> {destination}")
+    subprocess.run(cmd, check=True)
+    return str(dest)
+
+
+def download_file(url: str, destination: str, timeout: int = 120) -> str:
+    """Download a remote file into destination path."""
+    _ensure_dir(os.path.dirname(destination) or ".")
+    print(f"[transform] Downloading {url} -> {destination}")
+
+    request = urllib.request.Request(url, headers={"User-Agent": "ResearchExperimentEnv/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response, open(destination, "wb") as f:
+        shutil.copyfileobj(response, f)
+    return destination
+
+
+def extract_zip(zip_path: str, destination_dir: str) -> str:
+    """Extract a zip archive to destination_dir."""
+    _ensure_dir(destination_dir)
+    print(f"[transform] Extracting {zip_path} -> {destination_dir}")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(destination_dir)
+    return destination_dir
+
+
+def run_external_downloads(external_root: str, cfg: dict) -> None:
+    """Run download steps defined in cfg into data/external.
+
+    Expected keys:
+      github_repos: [{url, dest?, branch?, depth?}, ...]
+      files:        [{url, dest?}, ...]
+      zip_files:    [{url, dest?, extract_to?} OR {path, extract_to?}, ...]
+    """
+    _ensure_dir(external_root)
+
+    for repo in cfg.get("github_repos", []):
+        url = repo["url"]
+        dest_name = repo.get("dest") or url.rstrip("/").split("/")[-1].replace(".git", "")
+        dest = os.path.join(external_root, dest_name)
+        clone_github_repo(url, dest, branch=repo.get("branch"), depth=int(repo.get("depth", 1)))
+
+    for item in cfg.get("files", []):
+        url = item["url"]
+        dest_name = item.get("dest") or url.split("/")[-1]
+        dest = os.path.join(external_root, dest_name)
+        download_file(url, dest)
+
+    for item in cfg.get("zip_files", []):
+        if "url" in item:
+            url = item["url"]
+            dest_name = item.get("dest") or url.split("/")[-1]
+            zip_path = os.path.join(external_root, dest_name)
+            download_file(url, zip_path)
+        else:
+            zip_rel_or_abs = item["path"]
+            zip_path = zip_rel_or_abs if os.path.isabs(zip_rel_or_abs) else os.path.join(external_root, zip_rel_or_abs)
+
+        extract_to = item.get("extract_to") or Path(zip_path).stem
+        extract_dir = extract_to if os.path.isabs(extract_to) else os.path.join(external_root, extract_to)
+        extract_zip(zip_path, extract_dir)
+
+
+def _root_for_source(source: str, paths_cfg: dict) -> str:
+    mapping = {
+        "external": paths_cfg.get("data_external", "data/external"),
+        "transformed": paths_cfg.get("data_transformed", "data/transformed"),
+        "processed": paths_cfg.get("data_processed", "data/processed"),
+    }
+    return mapping.get(source, mapping["external"])
+
+
+def _detect_adapter(path: str) -> str:
+    p = Path(path)
+    if p.is_dir():
+        return "copy_dir"
+    if p.suffix.lower() == ".csv":
+        return "csv"
+    return "copy_file"
+
+
+def _resolve_item_path(item: dict, paths_cfg: dict) -> str:
+    path = item["path"]
+    if os.path.isabs(path):
+        return path
+    return os.path.join(_root_for_source(item.get("source", "external"), paths_cfg), path)
+
+
+def _normalize_input_items(data_cfg: dict, explicit_inputs: list[str] | None = None) -> list[dict]:
+    if explicit_inputs:
+        return [{"path": p} for p in explicit_inputs]
+
+    items = data_cfg.get("transform", {}).get("inputs", [])
+    normalized: list[dict] = []
+    for item in items:
+        if isinstance(item, str):
+            normalized.append({"path": item})
+        elif isinstance(item, dict) and "path" in item:
+            normalized.append(dict(item))
+        else:
+            raise ValueError(f"Invalid transform input item: {item}")
+    return normalized
+
+
+def resolve_input_items(paths_cfg: dict, data_cfg: dict, explicit_inputs: list[str] | None = None) -> list[dict]:
+    """Resolve transform inputs with adapter metadata."""
+    normalized = _normalize_input_items(data_cfg=data_cfg, explicit_inputs=explicit_inputs)
+
+    resolved: list[dict] = []
+    for item in normalized:
+        resolved_path = _resolve_item_path(item, paths_cfg)
+        if not os.path.exists(resolved_path):
+            print(f"[transform] Warning: input not found: {resolved_path}")
+            continue
+
+        adapter = item.get("adapter") or _detect_adapter(resolved_path)
+        resolved.append({"path": resolved_path, "adapter": adapter, "output": item.get("output")})
+
+    return resolved
+
+
+def transform_csv_inputs(
+    input_paths: list[str],
+    output_path: str,
+    preprocessing_cfg: dict,
+    target_column: str = "target",
+    include_source_column: bool = True,
+) -> str:
+    """CSV adapter: transform one or multiple CSV files and save unified CSV."""
+    if not input_paths:
+        raise ValueError("No CSV input files resolved for transformation.")
+
+    transformed_frames: list[pd.DataFrame] = []
+    for in_path in input_paths:
+        print(f"[transform] Loading CSV: {in_path}")
+        df = load_csv(in_path)
+        df = clean_dataframe(df, drop_duplicates=preprocessing_cfg.get("drop_duplicates", True))
+        df = handle_missing(df, strategy=preprocessing_cfg.get("handle_missing", "drop"))
+
+        scale = preprocessing_cfg.get("scale")
+        if scale and scale != "null":
+            cols = [c for c in df.columns if c != target_column]
+            if cols:
+                df, _ = scale_features(df, method=scale, columns=cols)
+
+        df = add_derived_features(df)
+        if include_source_column:
+            df["_source_file"] = os.path.basename(in_path)
+        transformed_frames.append(df)
+
+    merged = pd.concat(transformed_frames, ignore_index=True)
+    _ensure_dir(os.path.dirname(output_path) or ".")
+    merged.to_csv(output_path, index=False)
+    print(f"[transform] Wrote transformed CSV: {output_path} ({len(merged)} rows)")
+    return output_path
+
+
+def transform_items(
+    items: list[dict],
+    transformed_root: str,
+    preprocessing_cfg: dict,
+    target_column: str = "target",
+    csv_output_file: str = "transformed_dataset.csv",
+    include_source_column: bool = True,
+) -> dict:
+    """Run transform adapters for heterogeneous inputs."""
+    if not items:
+        raise ValueError("No input items resolved for transformation.")
+
+    _ensure_dir(transformed_root)
+    assets_root = os.path.join(transformed_root, "assets")
+    _ensure_dir(assets_root)
+
+    csv_inputs: list[str] = []
+    copied_outputs: list[str] = []
+
+    for item in items:
+        src = item["path"]
+        adapter = item.get("adapter", "copy_file")
+        output_rel = item.get("output")
+        dest = os.path.join(transformed_root, output_rel) if output_rel else os.path.join(assets_root, os.path.basename(src))
+
+        if adapter == "csv":
+            csv_inputs.append(src)
+            continue
+        if adapter in ("copy_file", "file"):
+            _ensure_dir(os.path.dirname(dest) or ".")
+            shutil.copy2(src, dest)
+            copied_outputs.append(dest)
+            continue
+        if adapter in ("copy_dir", "dir"):
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest)
+            copied_outputs.append(dest)
+            continue
+
+        raise ValueError(f"Unsupported adapter '{adapter}' for input '{src}'")
+
+    csv_output = None
+    if csv_inputs:
+        csv_output = os.path.join(transformed_root, csv_output_file)
+        transform_csv_inputs(csv_inputs, csv_output, preprocessing_cfg, target_column, include_source_column)
+
+    return {"csv_output": csv_output, "copied_outputs": copied_outputs}
 ''',
 
     "src/data/preprocess.py": '''\
@@ -1143,6 +1406,17 @@ def _parse_override(s: str):
     return d
 
 
+def _resolve_data_root(paths_cfg: dict, source: str) -> str:
+    mapping = {
+        "external": paths_cfg.get("data_external", "data/external"),
+        "transformed": paths_cfg.get("data_transformed", "data/transformed"),
+        "processed": paths_cfg.get("data_processed", "data/processed"),
+    }
+    if source not in mapping:
+        raise ValueError(f"Unknown data source '{source}'. Choose from: {list(mapping)}")
+    return mapping[source]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train a PyTorch model.")
     parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config")
@@ -1206,7 +1480,10 @@ def main():
 
     # ── Pipeline ──
     # 1. Load data
-    data_file = os.path.join(paths_cfg.get("data_raw", "data/raw"), data_cfg.get("file", "dataset.csv"))
+    data_source = data_cfg.get("source", "transformed")
+    data_root = _resolve_data_root(paths_cfg, data_source)
+    data_file = os.path.join(data_root, data_cfg.get("file", "dataset.csv"))
+
     print(f"Loading data from {data_file} ...")
     df = load_csv(data_file)
     print(f"  Loaded {len(df)} rows, {len(df.columns)} columns")
@@ -1319,7 +1596,7 @@ if __name__ == "__main__":
 """Evaluate a saved PyTorch model on a dataset.
 
 Usage:
-    python scripts/evaluate.py --run outputs/experiments/default_20240101_120000 --data data/raw/test.csv
+    python scripts/evaluate.py --run outputs/experiments/default_20240101_120000 --data data/transformed/test.csv
     python scripts/evaluate.py --no-gpu --run <run> --data <csv>
 """
 
@@ -1409,7 +1686,7 @@ if __name__ == "__main__":
 """Run inference with a trained PyTorch model and save predictions.
 
 Usage:
-    python scripts/predict.py --run outputs/experiments/default_20240101_120000 --data data/raw/new_data.csv
+    python scripts/predict.py --run outputs/experiments/default_20240101_120000 --data data/transformed/new_data.csv
     python scripts/predict.py --no-gpu --run <run> --data <csv>
 """
 
@@ -1490,13 +1767,116 @@ if __name__ == "__main__":
     main()
 ''',
 
+    "scripts/transform.py": '''\
+#!/usr/bin/env python3
+"""Download external data sources and transform heterogeneous data into data/transformed.
+
+Usage:
+    python scripts/transform.py --config configs/default.yaml
+    python scripts/transform.py --download-only
+    python scripts/transform.py --transform-only --inputs data/external/train.csv data/external/assets
+"""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.utils.io import load_yaml
+from src.data.transform import run_external_downloads, resolve_input_items, transform_items
+
+
+def _deep_update(base: dict, overrides: dict) -> dict:
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def load_config(config_path: str) -> dict:
+    cfg = load_yaml(config_path)
+    defaults = cfg.pop("defaults", [])
+
+    for default in defaults:
+        if isinstance(default, dict):
+            for group, name in default.items():
+                sub_path = os.path.join(os.path.dirname(config_path), group, f"{name}.yaml")
+                if os.path.exists(sub_path):
+                    _deep_update(cfg, load_yaml(sub_path))
+    return cfg
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download and transform datasets.")
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config")
+    parser.add_argument("--download-only", action="store_true", help="Only run external data downloads")
+    parser.add_argument("--transform-only", action="store_true", help="Only run transformation step")
+    parser.add_argument("--inputs", nargs="*", default=None,
+                        help="Input files/directories (absolute or relative); overrides config transform.inputs")
+    parser.add_argument("--output", help="Output transformed CSV path (overrides config, CSV adapter only)")
+    args = parser.parse_args()
+
+    if args.download_only and args.transform_only:
+        raise ValueError("Cannot use both --download-only and --transform-only")
+
+    cfg = load_config(args.config)
+    paths_cfg = cfg.get("paths", {})
+    data_cfg = cfg.get("data", {})
+
+    external_root = paths_cfg.get("data_external", "data/external")
+    transformed_root = paths_cfg.get("data_transformed", "data/transformed")
+
+    external_sources_cfg = cfg.get("external_sources", {})
+
+    if not args.transform_only:
+        print("[transform] Running external downloads...")
+        run_external_downloads(external_root=external_root, cfg=external_sources_cfg)
+
+    if not args.download_only:
+        print("[transform] Running transformation...")
+        items = resolve_input_items(paths_cfg=paths_cfg, data_cfg=data_cfg, explicit_inputs=args.inputs)
+
+        transform_cfg = data_cfg.get("transform", {})
+        out_name = transform_cfg.get("output_file") or f"transformed_{data_cfg.get('file', 'dataset.csv')}"
+        csv_output_file = os.path.basename(args.output) if args.output else out_name
+
+        preproc = data_cfg.get("preprocessing", {})
+        target = data_cfg.get("target_column", "target")
+
+        result = transform_items(
+            items=items,
+            transformed_root=transformed_root,
+            preprocessing_cfg=preproc,
+            target_column=target,
+            csv_output_file=csv_output_file,
+            include_source_column=bool(transform_cfg.get("include_source_column", True)),
+        )
+
+        if args.output and result.get("csv_output"):
+            desired = args.output
+            current = result["csv_output"]
+            if os.path.abspath(desired) != os.path.abspath(current):
+                os.makedirs(os.path.dirname(desired) or ".", exist_ok=True)
+                os.replace(current, desired)
+                print(f"[transform] Moved CSV output: {current} -> {desired}")
+
+    print("[transform] Done")
+
+
+if __name__ == "__main__":
+    main()
+''',
+
     "scripts/preprocess.py": '''\
 #!/usr/bin/env python3
 """Run the data preprocessing pipeline only.
 
 Usage:
     python scripts/preprocess.py --config configs/default.yaml
-    python scripts/preprocess.py --input data/raw/dataset.csv --output data/processed/clean.csv
+    python scripts/preprocess.py --input data/transformed/dataset.csv --output data/processed/clean.csv
 """
 
 import argparse
@@ -1512,7 +1892,7 @@ from src.features.build_features import add_derived_features
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess raw data.")
+    parser = argparse.ArgumentParser(description="Preprocess tabular input data.")
     parser.add_argument("--config", help="Path to YAML config")
     parser.add_argument("--input", help="Path to input CSV (overrides config)")
     parser.add_argument("--output", help="Path to save processed CSV (overrides config)")
@@ -1535,10 +1915,9 @@ def main():
         data_cfg = {}
         paths_cfg = {}
 
-    input_path = args.input or os.path.join(
-        paths_cfg.get("data_raw", "data/raw"),
-        data_cfg.get("file", "dataset.csv"),
-    )
+    source = data_cfg.get("source", "transformed")
+    input_root = _resolve_data_root(paths_cfg, source)
+    input_path = args.input or os.path.join(input_root, data_cfg.get("file", "dataset.csv"))
     output_path = args.output or os.path.join(
         paths_cfg.get("data_processed", "data/processed"),
         "processed_" + os.path.basename(input_path),
@@ -1629,13 +2008,19 @@ def test_experiment_logger_logs_metrics():
     # Makefile
     # =========================================================================
     "Makefile": """\
-.PHONY: help train evaluate predict preprocess test clean
+.PHONY: help train evaluate predict transform preprocess test clean
 
 help:  ## Show this help
 \t@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \\
 \t\tawk 'BEGIN {FS = ":.*?## "}; {printf "\\033[36m%-20s\\033[0m %s\\n", $$1, $$2}'
 
 # ── Data ──
+transform:  ## Download external sources and build data/transformed
+	python scripts/transform.py --config configs/default.yaml
+
+download-data:  ## Only download external sources into data/external
+	python scripts/transform.py --config configs/default.yaml --download-only
+
 preprocess:  ## Run the preprocessing pipeline
 \tpython scripts/preprocess.py --config configs/default.yaml
 
@@ -1648,7 +2033,7 @@ train-custom:  ## Train with overrides (e.g. make train-custom ARGS="--override 
 
 # ── Evaluation ──
 evaluate:  ## Evaluate latest run (set RUN=path/to/run)
-\tpython scripts/evaluate.py --run $(RUN) --data data/raw/test.csv
+	python scripts/evaluate.py --run $(RUN) --data data/transformed/test.csv
 
 predict:  ## Run inference (set RUN=path/to/run DATA=path/to/csv)
 \tpython scripts/predict.py --run $(RUN) --data $(DATA)
@@ -1670,6 +2055,7 @@ clean:  ## Remove caches and compiled files
 """Quick-start entry point — delegates to scripts/train.py.
 
 For full control use the individual scripts:
+    python scripts/transform.py --config configs/default.yaml
     python scripts/train.py --config configs/default.yaml
     python scripts/evaluate.py --run outputs/experiments/<run>
     python scripts/predict.py --run outputs/experiments/<run> --data data.csv
@@ -1822,12 +2208,14 @@ The `--no-gpu` and `--gpus` flags work the same way on all scripts:
 │       └── default.yaml     #     default dataset settings
 ├── scripts/                 # Entry points — run these
 │   ├── train.py             #   train a model
+│   ├── transform.py         #   download + transform to data/transformed
 │   ├── evaluate.py          #   evaluate a saved model
 │   ├── predict.py           #   run inference on new data
 │   └── preprocess.py        #   run data pipeline only
 ├── src/                     # Reusable source code
-│   ├── data/                #   data loading & preprocessing
+│   ├── data/                #   data loading, acquisition, transformation, preprocessing
 │   │   ├── load_data.py
+│   │   ├── transform.py
 │   │   ├── preprocess.py
 │   │   └── dataset.py       #   PyTorch Dataset class
 │   ├── models/              #   training & evaluation
@@ -1846,9 +2234,9 @@ The `--no-gpu` and `--gpus` flags work the same way on all scripts:
 │       ├── io.py               # save/load checkpoints, YAML, JSON
 │       └── gpu.py              # GPU selection and management
 ├── data/
-│   ├── raw/                 # Original, immutable data
-│   ├── processed/           # Cleaned / transformed data
-│   └── external/            # Third-party data
+│   ├── external/            # Downloads: repos, zip files, third-party assets
+│   ├── transformed/         # Standardized training-ready datasets + copied assets
+│   └── processed/           # Optional extra cleaned outputs
 ├── outputs/
 │   ├── experiments/         # Each run gets its own timestamped dir
 │   ├── figures/             # Saved plots
@@ -1881,7 +2269,8 @@ pip install -r requirements.txt
 
 ### Step 2 — Add your data
 
-Place your raw data file (e.g. `dataset.csv`) inside `data/raw/`.
+Put source assets in:
+- `data/external/` for downloaded repos/archives/auxiliary datasets or arbitrary folder/file assets
 
 ### Step 3 — Configure the experiment
 
@@ -1889,13 +2278,14 @@ Edit `configs/data/default.yaml` to match your dataset:
 
 ```yaml
 data:
-  name: my_dataset
-  file: dataset.csv            # filename inside data/raw/
-  target_column: target        # the column you want to predict
-  split_strategy: stratified   # random | stratified | temporal
-  preprocessing:
-    handle_missing: mean
-    scale: standard
+    name: my_dataset
+    file: transformed_dataset.csv # filename inside data/transformed/
+    source: transformed
+    target_column: target        # the column you want to predict
+    split_strategy: stratified   # random | stratified | temporal
+    preprocessing:
+        handle_missing: mean
+        scale: standard
 ```
 
 Edit `configs/model/baseline.yaml` to tune hyperparameters:
@@ -1910,7 +2300,30 @@ model:
     epochs: 100
 ```
 
-### Step 4 — Preprocess data (optional)
+Optional: define external downloads in `configs/default.yaml`:
+
+```yaml
+external_sources:
+        github_repos:
+                - url: https://github.com/owner/repo.git
+                    dest: repo_name
+        files:
+                - url: https://host/data/lookup.csv
+                    dest: lookup.csv
+        zip_files:
+                - url: https://host/data/archive.zip
+                    dest: archive.zip
+                    extract_to: datasets/archive
+```
+
+### Step 4 — Download + transform to `data/transformed`
+
+```bash
+python scripts/transform.py --config configs/default.yaml
+# Or: make transform
+```
+
+### Step 5 — Preprocess transformed data (optional)
 
 ```bash
 python scripts/preprocess.py --config configs/default.yaml
@@ -1919,7 +2332,7 @@ python scripts/preprocess.py --config configs/default.yaml
 
 Saves cleaned data to `data/processed/`.
 
-### Step 5 — Train a model
+### Step 6 — Train a model
 
 ```bash
 # Default config
@@ -1945,27 +2358,27 @@ outputs/experiments/default_20260317_143022/
     └── training_history.png
 ```
 
-### Step 6 — Evaluate a model
+### Step 7 — Evaluate a model
 
 ```bash
 python scripts/evaluate.py \\
     --run outputs/experiments/default_20260317_143022 \\
-    --data data/raw/test.csv
+    --data data/transformed/test.csv
 
 # Or with a standalone model file
 python scripts/evaluate.py --model path/to/model.joblib --data test.csv --target label
 ```
 
-### Step 7 — Run predictions
+### Step 8 — Run predictions
 
 ```bash
 python scripts/predict.py \\
     --run outputs/experiments/default_20260317_143022 \\
-    --data data/raw/new_data.csv \\
+    --data data/transformed/new_data.csv \\
     --output outputs/predictions/preds.csv
 ```
 
-### Step 8 — Run tests
+### Step 9 — Run tests
 
 ```bash
 python -m pytest tests/ -v
@@ -2050,7 +2463,7 @@ python scripts/train.py --override experiment.seed=99 model.params.n_estimators=
 
 ## Tips
 
-- **Never modify `data/raw/`** — treat it as immutable.
+- Use adapters in `data.transform.inputs` for non-tabular external assets.
 - **`make help`** shows all available Makefile commands.
 - **Pin deps** after installing: `pip freeze > requirements.txt`
 - **Notebooks are for exploration** — move reusable code into `src/`.
@@ -2094,8 +2507,8 @@ python scripts/train.py --override experiment.seed=99 model.params.n_estimators=
         with open(gitignore, "w") as f:
             f.write("\n".join([
                 "# Data (keep structure, ignore large files)",
-                "data/raw/*",
                 "data/external/*",
+                "data/transformed/*",
                 "!data/**/.gitkeep",
                 "",
                 "# Outputs",

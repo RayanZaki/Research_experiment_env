@@ -1,4 +1,4 @@
-"""Functions for loading raw data."""
+"""Functions for loading tabular data files."""
 
 import os
 import pandas as pd

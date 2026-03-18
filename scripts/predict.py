@@ -2,7 +2,7 @@
 """Run inference with a trained PyTorch model and save predictions.
 
 Usage:
-    python scripts/predict.py --run outputs/experiments/default_20240101_120000 --data data/raw/new_data.csv
+    python scripts/predict.py --run outputs/experiments/default_20240101_120000 --data data/transformed/new_data.csv
     python scripts/predict.py --no-gpu --run <run> --data <csv>
 """
 

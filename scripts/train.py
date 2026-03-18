@@ -67,6 +67,17 @@ def _parse_override(s: str):
     return d
 
 
+def _resolve_data_root(paths_cfg: dict, source: str) -> str:
+    mapping = {
+        "external": paths_cfg.get("data_external", "data/external"),
+        "transformed": paths_cfg.get("data_transformed", "data/transformed"),
+        "processed": paths_cfg.get("data_processed", "data/processed"),
+    }
+    if source not in mapping:
+        raise ValueError(f"Unknown data source '{source}'. Choose from: {list(mapping)}")
+    return mapping[source]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train a PyTorch model.")
     parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config")
@@ -130,7 +141,10 @@ def main():
 
     # ── Pipeline ──
     # 1. Load data
-    data_file = os.path.join(paths_cfg.get("data_raw", "data/raw"), data_cfg.get("file", "dataset.csv"))
+    data_source = data_cfg.get("source", "transformed")
+    data_root = _resolve_data_root(paths_cfg, data_source)
+    data_file = os.path.join(data_root, data_cfg.get("file", "dataset.csv"))
+
     print(f"Loading data from {data_file} ...")
     df = load_csv(data_file)
     print(f"  Loaded {len(df)} rows, {len(df.columns)} columns")

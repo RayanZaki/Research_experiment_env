@@ -2,7 +2,7 @@
 """Evaluate a saved PyTorch model on a dataset.
 
 Usage:
-    python scripts/evaluate.py --run outputs/experiments/default_20240101_120000 --data data/raw/test.csv
+    python scripts/evaluate.py --run outputs/experiments/default_20240101_120000 --data data/transformed/test.csv
     python scripts/evaluate.py --no-gpu --run <run> --data <csv>
 """
 

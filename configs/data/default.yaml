@@ -1,7 +1,8 @@
 # ── Dataset configuration ──
 data:
   name: default
-  file: dataset.csv
+  file: transformed_dataset.csv
+  source: transformed       # transformed | external | processed
   target_column: target
   features: null            # null = use all columns except target
   split_strategy: random    # random | stratified | temporal
@@ -11,3 +12,7 @@ data:
     handle_missing: mean    # drop | mean | median | zero
     scale: standard         # standard | minmax | robust | null
     drop_duplicates: true
+  transform:
+    inputs: []                          # [{path: "my.csv", source: external, adapter: csv}, {path: "assets", source: external, adapter: copy_dir}]
+    output_file: transformed_dataset.csv
+    include_source_column: true

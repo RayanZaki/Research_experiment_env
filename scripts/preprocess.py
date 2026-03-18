@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/preprocess.py --config configs/default.yaml
-    python scripts/preprocess.py --input data/raw/dataset.csv --output data/processed/clean.csv
+    python scripts/preprocess.py --input data/transformed/dataset.csv --output data/processed/clean.csv
 """
 
 import argparse
@@ -18,8 +18,19 @@ from src.data.preprocess import clean_dataframe, handle_missing, scale_features
 from src.features.build_features import add_derived_features
 
 
+def _resolve_data_root(paths_cfg: dict, source: str) -> str:
+    mapping = {
+        "external": paths_cfg.get("data_external", "data/external"),
+        "transformed": paths_cfg.get("data_transformed", "data/transformed"),
+        "processed": paths_cfg.get("data_processed", "data/processed"),
+    }
+    if source not in mapping:
+        raise ValueError(f"Unknown data source '{source}'. Choose from: {list(mapping)}")
+    return mapping[source]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess raw data.")
+    parser = argparse.ArgumentParser(description="Preprocess tabular input data.")
     parser.add_argument("--config", help="Path to YAML config")
     parser.add_argument("--input", help="Path to input CSV (overrides config)")
     parser.add_argument("--output", help="Path to save processed CSV (overrides config)")
@@ -42,10 +53,9 @@ def main():
         data_cfg = {}
         paths_cfg = {}
 
-    input_path = args.input or os.path.join(
-        paths_cfg.get("data_raw", "data/raw"),
-        data_cfg.get("file", "dataset.csv"),
-    )
+    source = data_cfg.get("source", "transformed")
+    input_root = _resolve_data_root(paths_cfg, source)
+    input_path = args.input or os.path.join(input_root, data_cfg.get("file", "dataset.csv"))
     output_path = args.output or os.path.join(
         paths_cfg.get("data_processed", "data/processed"),
         "processed_" + os.path.basename(input_path),

@@ -1,6 +1,6 @@
 # Data (keep structure, ignore large files)
-data/raw/*
 data/external/*
+data/transformed/*
 !data/**/.gitkeep
 
 # Outputs
